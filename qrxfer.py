@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""qrxfer - encrypted file transfer between two computers through animated QR codes.
+"""qrxfer - encrypted file transfer between two computers through the screen.
 
 The sender packs files into a compressed tar archive, encrypts it with a passphrase,
-cuts it into fountain-coded frames and shows them as animated QR codes. The receiver
-watches its own screen (for example a VNC viewer showing the sender's desktop),
-collects frames in any order until the archive can be rebuilt, then decrypts and
-extracts it. No network port is opened by qrxfer on either side.
+cuts it into fountain-coded frames and shows them as an animated full-screen colour
+grid (or as QR codes). The receiver watches its own screen (for example a VNC viewer
+showing the sender's desktop), collects frames in any order until the archive can be
+rebuilt, then decrypts and extracts it. No network port is opened by qrxfer.
 
-  qrxfer send FILE_OR_DIR...   show files as animated QR codes (stdlib only)
+  qrxfer send FILE_OR_DIR...   show files as an animated colour grid (stdlib only)
   qrxfer recv [-o DIR]         capture the screen and receive the files
   qrxfer genpass               print a strong random passphrase
   qrxfer decrypt FILE.qxf      decrypt a transfer saved after a wrong passphrase
@@ -39,7 +39,7 @@ import time
 import unicodedata
 import zlib
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 class QrxferError(Exception):
@@ -182,10 +182,15 @@ class Frame:
         return -(-self.blob_len // self.block_size)
 
 
-def pack_frame(frame):
+def frame_bytes(frame):
+    """The binary frame: header, payload, CRC32. A grid row carries exactly this."""
     body = _FRAME_HDR.pack(FRAME_VERSION, frame.tid, frame.blob_len, frame.block_size,
                            frame.seq, frame.degree) + frame.payload
-    return FRAME_PREFIX + b45encode(body + _CRC.pack(zlib.crc32(body))) + FRAME_SUFFIX
+    return body + _CRC.pack(zlib.crc32(body))
+
+
+def pack_frame(frame):
+    return FRAME_PREFIX + b45encode(frame_bytes(frame)) + FRAME_SUFFIX
 
 
 def parse_frame(text):
@@ -193,7 +198,11 @@ def parse_frame(text):
     text = text.strip()
     if not (text.startswith(FRAME_PREFIX) and text.endswith(FRAME_SUFFIX)):
         raise ValueError("not a qrxfer frame")
-    raw = b45decode(text[len(FRAME_PREFIX):-len(FRAME_SUFFIX)])
+    return parse_frame_bytes(b45decode(text[len(FRAME_PREFIX):-len(FRAME_SUFFIX)]))
+
+
+def parse_frame_bytes(raw):
+    """Check and decode one binary frame; raises ValueError for anything that is not ours."""
     if len(raw) <= FRAME_OVERHEAD:
         raise ValueError("frame too short")
     body = raw[:-_CRC.size]
@@ -240,22 +249,37 @@ class FountainEncoder:
 class FountainDecoder:
     """Incremental Gaussian elimination over GF(2).
 
-    Each equation is a bitmask of block indices plus the XOR of those blocks (both
-    Python ints). Rows are kept in echelon form keyed by their lowest set bit, so
-    `rank` is exact progress: the data is complete when rank == k.
+    Blocks known on their own (systematic frames, or equations solved down to one
+    block) are kept as values only. Other equations are a bitmask of the still-missing
+    block indices plus the XOR of those blocks (both Python ints), kept in echelon form
+    keyed by their lowest set bit, so `rank` is exact progress: the data is complete
+    when rank == k. Known blocks are substituted into repair frames before elimination:
+    rows that kept every block would make each later repair frame cascade through all
+    of them (with tens of thousands of blocks and a few percent missing, ~0.1 s per
+    frame), and a bitmask per known block would need ~k*k/16 bytes.
     """
+
+    # Late joiners: while systematic frames still arrive (a grid sender repeats them)
+    # and many blocks are missing, repair frames would only add long rows; skip them.
+    SKIP_MIN_K = 8192
+    SKIP_WINDOW = 1024
 
     def __init__(self, tid, blob_len, block_size):
         self.tid, self.blob_len, self.block_size = tid, blob_len, block_size
         self.k = -(-blob_len // block_size)
-        self.rank = 0
         self.received = 0
-        self._rows = {}
+        self._known = {}  # block -> value
+        self._rows = {}   # lowest block -> (mask, value) of the other equations
         self._seen = set()
+        self._since_systematic = self.SKIP_WINDOW  # repair frames since the last new systematic one
 
     @classmethod
     def for_frame(cls, frame):
         return cls(frame.tid, frame.blob_len, frame.block_size)
+
+    @property
+    def rank(self):
+        return len(self._known) + len(self._rows)
 
     @property
     def complete(self):
@@ -268,21 +292,46 @@ class FountainDecoder:
         if frame.seq in self._seen or self.complete:
             return False
         self._seen.add(frame.seq)
-        self.received += 1
+        value = int.from_bytes(frame.payload, "little")
+        known = self._known
         if frame.seq < self.k:
-            mask = 1 << frame.seq
+            self.received += 1
+            self._since_systematic = 0
+            i = frame.seq
+            known[i] = value
+            row = self._rows.pop(i, None)
+            if row is None:
+                return True
+            # Block i headed an equation over other blocks too: knowing it leaves one
+            # about the others.
+            mask, value = row[0] & (row[0] - 1), row[1] ^ value
         else:
+            self._since_systematic += 1
+            if (self.k >= self.SKIP_MIN_K and self._since_systematic <= self.SKIP_WINDOW
+                    and 8 * (self.k - len(known)) > self.k):
+                return False
+            self.received += 1
             mask = 0
             for i in repair_indices(self.tid, frame.seq, self.k, frame.degree):
-                mask |= 1 << i
-        value = int.from_bytes(frame.payload, "little")
+                v = known.get(i)
+                if v is None:
+                    mask |= 1 << i
+                else:
+                    value ^= v
         rows = self._rows
         while mask:
             pivot = (mask & -mask).bit_length() - 1
+            v = known.get(pivot)
+            if v is not None:  # learnt after this row was stored
+                mask &= mask - 1
+                value ^= v
+                continue
             row = rows.get(pivot)
             if row is None:
-                rows[pivot] = (mask, value)
-                self.rank += 1
+                if mask & (mask - 1):
+                    rows[pivot] = (mask, value)
+                else:
+                    known[pivot] = value
                 return True
             mask ^= row[0]
             value ^= row[1]
@@ -292,13 +341,13 @@ class FountainDecoder:
         if not self.complete:
             raise ValueError("transfer incomplete")
         solved = [0] * self.k
-        rows = self._rows
+        known, rows = self._known, self._rows
         for pivot in range(self.k - 1, -1, -1):
-            mask, value = rows[pivot]
-            rest = mask >> (pivot + 1)
-            if rest:
-                # Walk the set bits of the (possibly dense) mask via its binary string.
-                bits = bin(rest)
+            value = known.get(pivot)
+            if value is None:
+                mask, value = rows[pivot]
+                # Walk the set bits above the pivot via the mask's binary string.
+                bits = bin(mask >> (pivot + 1))
                 base = len(bits) + pivot  # bits[pos] is block index base - pos
                 pos = bits.find("1", 2)
                 while pos != -1:
@@ -851,6 +900,8 @@ FRAME_MASK = 0
 class FrameStream:
     """Turns consecutive fountain frames into QR codes."""
 
+    unit = "code"
+
     def __init__(self, encoder, level):
         self.encoder, self.level = encoder, level
         self.seq = 0
@@ -858,6 +909,10 @@ class FrameStream:
         if self.version is None:
             raise QrxferError("frames do not fit in a QR code; use a lower --density")
         self.size = self.version * 4 + 17
+
+    def phase(self):
+        k = self.encoder.k
+        return "first pass %d%%" % (self.seq * 100 // k) if self.seq < k else "repair frames"
 
     def take(self, count):
         codes = []
@@ -948,14 +1003,12 @@ class _SendState:
         return True
 
     def status(self, count):
-        enc = self.stream.encoder
-        seq = self.stream.seq
-        first = "first pass %d%%" % min(100, seq * 100 // enc.k) if seq < enc.k else "repair frames"
         fps = self.actual_fps()
-        rate = count * fps * enc.block_size
+        rate = count * fps * self.stream.encoder.block_size
         state = "PAUSED" if self.paused else "%.1f/%.1f fps" % (fps, self.fps)
-        return ("qrxfer  frame %d  %s  %d code%s x %s = %s/s  |  keys: space pause, +/- speed, q quit"
-                % (seq, first, count, "" if count == 1 else "s", state, human_size(rate)))
+        return ("qrxfer  frame %d  %s  %d %s%s x %s = %s/s  |  keys: space pause, +/- speed, q quit"
+                % (self.stream.seq, self.stream.phase(), count, self.stream.unit, "" if count == 1 else "s",
+                   state, human_size(rate)))
 
 
 def qr_to_pgm(rows, size):
@@ -1199,15 +1252,122 @@ def run_terminal_sender(make_stream, opts):
 
 
 # ---------------------------------------------------------------------------
-# Receiver: screen capture, QR decoding and the collection loop
+# Colour grid sender: a full-screen X11 window (libX11 through ctypes, so still no
+# packages) filled with cells in the 8 corner colours of the RGB cube, 3 bits each.
+# Every row of cells carries one binary fountain frame, so a torn screen only loses
+# the rows the tear crosses. A black/white timing ring around the cells shows the
+# receiver every cell boundary. VNC servers send this sharp-edged content with
+# few colours losslessly, and it carries ~10x more per screen than QR codes.
 # ---------------------------------------------------------------------------
 
-def _need_numpy():
-    try:
-        import numpy
-        return numpy
-    except ImportError:
-        raise QrxferError("numpy is required to receive: sudo apt install python3-numpy (or pip install numpy)")
+GRID_CELL_PX = 3       # default cell size in pixels
+GRID_STATUS_PX = 18    # status line below the grid
+GRID_MIN_BLOCK = 32    # bytes per row below which the screen is too small
+GRID_MAX_CELL_PX = 16  # largest cell size the receiver looks for
+GRID_MIN_COLS = 59     # narrowest row that holds a frame (block of 1 byte)
+
+
+def plan_cells(width, height, px):
+    """Data cells (cols, rows) for a width x height pixel area. Both counts are odd, so
+    all four corners of the one-cell timing ring are white; a one-cell black margin
+    separates the ring from whatever surrounds the area."""
+    cols, rows = width // px - 4, height // px - 4
+    return cols - (cols + 1) % 2, rows - (rows + 1) % 2
+
+
+def grid_row_bytes(cols):
+    """Frame bytes that one row of `cols` cells carries (3 bits per cell)."""
+    return 3 * cols // 8
+
+
+def grid_block_size(cols):
+    """Fountain block size that one row of `cols` cells carries."""
+    return grid_row_bytes(cols) - FRAME_OVERHEAD
+
+
+@functools.lru_cache(maxsize=4)
+def grid_whitening(nbytes, rows):
+    """Fixed pattern for `rows` rows of `nbytes` each: row y XORs its cells with bytes
+    y*nbytes..(y+1)*nbytes, so cells look random even where frames hold runs of zeros
+    or fields that all rows share (header, padding of a short last block)."""
+    return hashlib.shake_256(b"qrxfer grid").digest(nbytes * rows)
+
+
+def _grid_row_pattern(cols, rows, y):
+    """Row y's whitening as a 3*cols-bit int (the first bits of its pattern bytes)."""
+    nbytes = (3 * cols + 7) // 8
+    row = grid_whitening(nbytes, rows)[y * nbytes:(y + 1) * nbytes]
+    return int.from_bytes(row, "big") >> (8 * nbytes - 3 * cols)
+
+
+def grid_row_digits(raw, cols, y):
+    """Frame bytes shown in row y (0 = top) as `cols` octal digits, one per cell: colour
+    = 4*red + 2*green + blue. The frame's bits come first, most significant first, then
+    zeros up to 3*cols bits; all of them are XORed with the row's whitening."""
+    n = int.from_bytes(raw, "big") << (3 * cols - 8 * len(raw))
+    return format(n ^ _grid_row_pattern(cols, y + 1, y), "0%do" % cols)
+
+
+class GridStream:
+    """Turns fountain frames into grid rows, one frame per row of cells. After the first
+    pass, screens of new repair frames alternate with screens repeating the systematic
+    frames, so a receiver started late gets most blocks on their own (cheap to decode)."""
+
+    unit = "row"
+
+    def __init__(self, encoder, cols, rows):
+        self.encoder, self.cols, self.rows = encoder, cols, rows
+        self.seq = 0  # frames shown
+        self._repair, self._repeat, self._after = encoder.k, 0, 0
+
+    def phase(self):
+        k = self.encoder.k
+        return "first pass %d%%" % (self.seq * 100 // k) if self.seq < k else "repair + repeats"
+
+    def take(self, count):
+        k, out = self.encoder.k, []
+        repeat = self.seq >= k and self._after % 2 == 1
+        self._after += self.seq >= k
+        for _ in range(count):
+            if self.seq < k:
+                seq = self.seq
+            elif repeat:
+                seq, self._repeat = self._repeat, (self._repeat + 1) % k
+            else:
+                seq, self._repair = self._repair, self._repair + 1
+            out.append(frame_bytes(self.encoder.frame(seq)))
+            self.seq += 1
+        return out
+
+
+class GridPainter:
+    """Renders a screen of rows, ring included, as 32-bit pixels. Each line of cells is
+    one join over a table of pre-rendered cells, fast enough for Python 3.6."""
+
+    def __init__(self, cols, rows, px, pixel):
+        self.cols, self.rows, self.px = cols, rows, px
+        self.patterns = None
+        self.width, self.height = (cols + 2) * px, (rows + 2) * px
+        self.table = [b""] * 256
+        for s in range(8):
+            self.table[ord("0") + s] = pixel(255 * (s >> 2), 255 * (s >> 1 & 1), 255 * (s & 1)) * px
+        # Ring cell (x, y) is white (7) where x + y is even, black (0) elsewhere.
+        self.ring = self._line(("70" * (cols + 2))[:cols + 2])
+
+    def _line(self, cells):
+        return b"".join(map(self.table.__getitem__, cells.encode("ascii"))) * self.px
+
+    def paint(self, frames):
+        if self.patterns is None:
+            self.patterns = [_grid_row_pattern(self.cols, self.rows, y) for y in range(self.rows)]
+        shift, fmt = 3 * self.cols - 8 * grid_row_bytes(self.cols), "0%do" % self.cols
+        lines = [self.ring]
+        for y, raw in enumerate(frames):
+            n = (int.from_bytes(raw, "big") << shift) ^ self.patterns[y]
+            edge = "70"[y % 2 == 0]  # ring cells (0, y + 1) and (cols + 1, y + 1)
+            lines.append(self._line(edge + format(n, fmt) + edge))
+        lines.append(self.ring)
+        return b"".join(lines)
 
 
 class _XImage(ctypes.Structure):
@@ -1220,6 +1380,234 @@ class _XImage(ctypes.Structure):
     ]
 
 
+class _XSetWindowAttributes(ctypes.Structure):
+    _fields_ = [
+        ("background_pixmap", ctypes.c_ulong), ("background_pixel", ctypes.c_ulong),
+        ("border_pixmap", ctypes.c_ulong), ("border_pixel", ctypes.c_ulong),
+        ("bit_gravity", ctypes.c_int), ("win_gravity", ctypes.c_int), ("backing_store", ctypes.c_int),
+        ("backing_planes", ctypes.c_ulong), ("backing_pixel", ctypes.c_ulong), ("save_under", ctypes.c_int),
+        ("event_mask", ctypes.c_long), ("do_not_propagate_mask", ctypes.c_long),
+        ("override_redirect", ctypes.c_int), ("colormap", ctypes.c_ulong), ("cursor", ctypes.c_ulong),
+    ]
+
+
+class _XColor(ctypes.Structure):
+    _fields_ = [("pixel", ctypes.c_ulong), ("red", ctypes.c_ushort), ("green", ctypes.c_ushort),
+                ("blue", ctypes.c_ushort), ("flags", ctypes.c_char), ("pad", ctypes.c_char)]
+
+
+_XLIB = []
+
+
+def _xlib():
+    """libX11 with the prototypes used by the grid window and the screen grabber."""
+    if _XLIB:
+        return _XLIB[0]
+    libname = ctypes.util.find_library("X11") or "libX11.so.6"
+    try:
+        x = ctypes.CDLL(libname)
+    except OSError:
+        raise QrxferError("libX11 not found; the grid window and screen capture need an X11 session")
+    vp, ul, i, ui = ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_uint
+    image = ctypes.POINTER(_XImage)
+    for name, res, args in (
+            ("XOpenDisplay", vp, [ctypes.c_char_p]), ("XCloseDisplay", i, [vp]),
+            ("XDefaultScreen", i, [vp]), ("XRootWindow", ul, [vp, i]),
+            ("XDisplayWidth", i, [vp, i]), ("XDisplayHeight", i, [vp, i]),
+            ("XDefaultDepth", i, [vp, i]), ("XDefaultVisual", vp, [vp, i]),
+            ("XGetImage", image, [vp, ul, i, i, ui, ui, ul, i]), ("XDestroyImage", i, [image]),
+            ("XCreateImage", image, [vp, vp, ui, i, i, vp, ui, ui, i, i]),
+            ("XPutImage", i, [vp, ul, vp, image, i, i, i, i, ui, ui]),
+            ("XCreateWindow", ul, [vp, ul, i, i, ui, ui, ui, i, ui, vp, ul,
+                                   ctypes.POINTER(_XSetWindowAttributes)]),
+            ("XStoreName", i, [vp, ul, ctypes.c_char_p]), ("XSelectInput", i, [vp, ul, ctypes.c_long]),
+            ("XMapRaised", i, [vp, ul]), ("XDestroyWindow", i, [vp, ul]),
+            ("XGrabKeyboard", i, [vp, ul, i, i, i, ul]), ("XUngrabKeyboard", i, [vp, ul]),
+            ("XPending", i, [vp]), ("XNextEvent", i, [vp, vp]),
+            ("XLookupString", i, [vp, ctypes.c_char_p, i, vp, vp]),
+            ("XCreateGC", vp, [vp, ul, ul, vp]), ("XFreeGC", i, [vp, vp]),
+            ("XSetForeground", i, [vp, vp, ul]), ("XSetBackground", i, [vp, vp, ul]),
+            ("XDrawImageString", i, [vp, ul, vp, i, i, ctypes.c_char_p, i]),
+            ("XCreateBitmapFromData", ul, [vp, ul, ctypes.c_char_p, ui, ui]),
+            ("XCreatePixmapCursor", ul, [vp, ul, ul, ctypes.POINTER(_XColor), ctypes.POINTER(_XColor), ui, ui]),
+            ("XDefineCursor", i, [vp, ul, ul]), ("XFreeCursor", i, [vp, ul]), ("XFreePixmap", i, [vp, ul]),
+            ("XSync", i, [vp, i])):
+        getattr(x, name).restype = res
+        getattr(x, name).argtypes = args
+    _XLIB.append(x)
+    return x
+
+
+def _pixel_format(image):
+    """For a 32-bit TrueColor XImage: pixel(r, g, b) -> its 4 bytes, and the byte index
+    of red, green and blue within a pixel."""
+    im = image.contents
+    if im.bits_per_pixel != 32:
+        raise QrxferError("unsupported screen depth: %d bits per pixel" % im.bits_per_pixel)
+    shifts = []
+    for mask in (im.red_mask, im.green_mask, im.blue_mask):
+        shift = (mask & -mask).bit_length() - 1
+        if shift < 0 or mask >> shift != 0xFF:
+            raise QrxferError("unsupported visual (colour masks %#x %#x %#x)"
+                              % (im.red_mask, im.green_mask, im.blue_mask))
+        shifts.append(shift)
+    order = "big" if im.byte_order else "little"
+
+    def pixel(r, g, b):
+        return (r << shifts[0] | g << shifts[1] | b << shifts[2]).to_bytes(4, order)
+
+    return pixel, tuple(s // 8 if order == "little" else 3 - s // 8 for s in shifts)
+
+
+class X11GridWindow:
+    """A full-screen override-redirect window that shows grid screens with XPutImage.
+
+    Override-redirect puts it exactly over the whole screen, with or without a window
+    manager. Such a window never gets the focus, so it grabs the keyboard (keys typed
+    into the VNC viewer reach it), and it hides the mouse pointer, which would
+    otherwise cover cells."""
+
+    def __init__(self):
+        self.x = x = _xlib()
+        self.dpy = x.XOpenDisplay(None)
+        if not self.dpy:
+            raise QrxferError("cannot open X display %r - run this inside the desktop session, "
+                              "or use --terminal" % os.environ.get("DISPLAY", ""))
+        self.screen = x.XDefaultScreen(self.dpy)
+        self.width = x.XDisplayWidth(self.dpy, self.screen)
+        self.height = x.XDisplayHeight(self.dpy, self.screen)
+        self.win = self.image = self.gc = None
+        self.grabbed = False
+
+    def open(self, cols, rows, px):
+        x, dpy, scr = self.x, self.dpy, self.screen
+        if x.XDefaultDepth(dpy, scr) != 24:
+            raise QrxferError("the grid needs a 24-bit colour display (depth here: %d); use --codec qr"
+                              % x.XDefaultDepth(dpy, scr))
+        visual = x.XDefaultVisual(dpy, scr)
+        attrs = _XSetWindowAttributes(override_redirect=1, background_pixel=0)
+        cw_back_pixel, cw_override_redirect = 1 << 1, 1 << 9
+        self.win = x.XCreateWindow(dpy, x.XRootWindow(dpy, scr), 0, 0, self.width, self.height, 0, 24, 1,
+                                   visual, cw_back_pixel | cw_override_redirect, ctypes.byref(attrs))
+        x.XStoreName(dpy, self.win, b"qrxfer send")
+        x.XSelectInput(dpy, self.win, 1)  # KeyPressMask
+        blank = x.XCreateBitmapFromData(dpy, self.win, bytes(8), 8, 8)
+        colour = _XColor()
+        cursor = x.XCreatePixmapCursor(dpy, blank, blank, colour, colour, 0, 0)
+        x.XDefineCursor(dpy, self.win, cursor)
+        x.XFreeCursor(dpy, cursor)
+        x.XFreePixmap(dpy, blank)
+        x.XMapRaised(dpy, self.win)
+        x.XSync(dpy, 0)
+        for _ in range(20):  # GrabSuccess once the window is viewable and no one else grabs
+            if x.XGrabKeyboard(dpy, self.win, 0, 1, 1, 0) == 0:
+                self.grabbed = True
+                break
+            time.sleep(0.05)
+        w, h = (cols + 2) * px, (rows + 2) * px
+        self.buf = ctypes.create_string_buffer(w * h * 4)
+        self.image = x.XCreateImage(dpy, visual, 24, 2, 0, self.buf, w, h, 32, 0)  # ZPixmap
+        pixel, _ = _pixel_format(self.image)
+        self.painter = GridPainter(cols, rows, px, pixel)
+        self.origin = ((self.width - w) // 2, (self.height - GRID_STATUS_PX - h) // 2)
+        im = self.image.contents
+        self.gc = x.XCreateGC(dpy, self.win, 0, None)
+        x.XSetForeground(dpy, self.gc, im.red_mask | im.green_mask | im.blue_mask)
+        x.XSetBackground(dpy, self.gc, 0)
+        self.event = (ctypes.c_long * 24)()  # an XEvent union
+        self.text = ctypes.create_string_buffer(8)
+
+    def show(self, frames):
+        data = self.painter.paint(frames)
+        ctypes.memmove(self.buf, data, len(data))
+        self.x.XPutImage(self.dpy, self.win, self.gc, self.image, 0, 0, self.origin[0], self.origin[1],
+                         self.painter.width, self.painter.height)
+        self.x.XSync(self.dpy, 0)  # wait for the server: no queue of stale screens builds up
+
+    def status(self, text):
+        data = text.encode("ascii", "replace")[:self.width // 6].ljust(self.width // 6)
+        self.x.XDrawImageString(self.dpy, self.win, self.gc, 6, self.height - 5, data, len(data))
+
+    def keys(self):
+        """Characters typed since the last call."""
+        out = []
+        while self.x.XPending(self.dpy):
+            self.x.XNextEvent(self.dpy, self.event)
+            if ctypes.c_int.from_buffer(self.event).value == 2:  # KeyPress
+                n = self.x.XLookupString(self.event, self.text, 8, None, None)
+                if n > 0:
+                    out.append(self.text.raw[:n].decode("latin-1"))
+        return out
+
+    def close(self):
+        x, dpy = self.x, self.dpy
+        if not dpy:
+            return
+        self.dpy = None
+        if self.grabbed:
+            x.XUngrabKeyboard(dpy, 0)
+        if self.image:
+            self.image.contents.data = None  # the pixels belong to self.buf
+            x.XDestroyImage(self.image)
+        if self.gc:
+            x.XFreeGC(dpy, self.gc)
+        if self.win:
+            x.XDestroyWindow(dpy, self.win)
+        x.XCloseDisplay(dpy)
+
+
+def run_x11_grid_sender(window, make_stream, opts):
+    """Show grid screens in `window` (an X11GridWindow). make_stream(width, height, px)
+    returns the GridStream for the area above the status line."""
+    state = None
+    stop = []
+
+    def on_signal(signum, frame):
+        # Set explicitly: a background job may start with SIGINT ignored.
+        stop.append(signum)
+
+    previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        stream = make_stream(window.width, window.height - GRID_STATUS_PX, opts.cell_px)
+        window.open(stream.cols, stream.rows, opts.cell_px)
+        state = _SendState(stream, opts)
+        note = "" if window.grabbed else "  (keyboard busy: stop with Ctrl+C in the terminal)"
+        shown = None
+        next_t = time.monotonic()
+        while not stop:
+            rows = state.advance(stream.rows)
+            if rows is not shown:  # the same list while paused
+                window.show(rows)
+                shown = rows
+            window.status(state.status(len(rows)) + note)
+            next_t = max(next_t + 1.0 / state.fps, time.monotonic())
+            while not stop:  # keys are polled even when drawing cannot keep up with --fps
+                for key in window.keys():
+                    if key == "\x03" or not state.handle_key(key):
+                        return state
+                delay = next_t - time.monotonic()
+                if delay <= 0:
+                    break
+                time.sleep(min(delay, 0.02))
+        return state
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        window.close()
+
+
+# ---------------------------------------------------------------------------
+# Receiver: screen capture, grid and QR decoding, and the collection loop
+# ---------------------------------------------------------------------------
+
+def _need_numpy():
+    try:
+        import numpy
+        return numpy
+    except ImportError:
+        raise QrxferError("numpy is required to receive: sudo apt install python3-numpy (or pip install numpy)")
+
+
 class XlibGrabber:
     """Screen capture through libX11's XGetImage (any region of the root window)."""
 
@@ -1227,21 +1615,7 @@ class XlibGrabber:
 
     def __init__(self):
         self.np = _need_numpy()
-        libname = ctypes.util.find_library("X11") or "libX11.so.6"
-        try:
-            x = self.x = ctypes.CDLL(libname)
-        except OSError:
-            raise QrxferError("libX11 not found; screen capture needs an X11 session")
-        x.XOpenDisplay.restype = ctypes.c_void_p
-        x.XOpenDisplay.argtypes = [ctypes.c_char_p]
-        x.XDefaultScreen.argtypes = [ctypes.c_void_p]
-        x.XRootWindow.restype = ctypes.c_ulong
-        x.XRootWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        x.XDisplayWidth.argtypes = x.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        x.XGetImage.restype = ctypes.POINTER(_XImage)
-        x.XGetImage.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
-                                ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_int]
-        x.XDestroyImage.argtypes = [ctypes.POINTER(_XImage)]
+        x = self.x = _xlib()
         # A failed request must not abort the process (Xlib's default error handler exits).
         self._on_error = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)(lambda d, e: 0)
         x.XSetErrorHandler(self._on_error)
@@ -1253,20 +1627,32 @@ class XlibGrabber:
         self.root = x.XRootWindow(self.dpy, screen)
         self.width = x.XDisplayWidth(self.dpy, screen)
         self.height = x.XDisplayHeight(self.dpy, screen)
+        img = self._get(0, 0, 1, 1)
+        try:
+            self.channels = _pixel_format(img)[1]  # byte index of red, green, blue
+        finally:
+            x.XDestroyImage(img)
 
-    def grab(self, left, top, width, height):
-        """Return the region as a 2-D uint8 numpy array (the green channel)."""
+    def _get(self, left, top, width, height):
         img = self.x.XGetImage(self.dpy, self.root, left, top, width, height, 0xFFFFFFFF, 2)
         if not img:
             raise QrxferError("screen capture failed")
+        return img
+
+    def grab(self, left, top, width, height, colour=False):
+        """The region as a numpy array: 2-D (the green channel; codes are black on white,
+        so one channel is as good as luminance), or with colour the raw 32-bit pixels as
+        (height, width, 4) bytes, red, green and blue at the indices in .channels."""
+        img = self._get(left, top, width, height)
         try:
             im = img.contents
             if im.bits_per_pixel != 32:
                 raise QrxferError("unsupported screen depth: %d bits per pixel" % im.bits_per_pixel)
             raw = ctypes.string_at(im.data, im.bytes_per_line * height)
             pixels = self.np.frombuffer(raw, self.np.uint8).reshape(height, im.bytes_per_line // 4, 4)
-            # Codes are black on white, so one channel is as good as luminance.
-            return self.np.ascontiguousarray(pixels[:, :width, 1])
+            if colour:
+                return pixels[:, :width]
+            return self.np.ascontiguousarray(pixels[:, :width, self.channels[1]])
         finally:
             self.x.XDestroyImage(img)
 
@@ -1411,6 +1797,254 @@ def open_qr_decoder(choice="auto"):
                       "sudo apt install python3-zxing-cpp  |  pip install zxing-cpp" % "; ".join(errors))
 
 
+def _longest_run(np, flags, gap):
+    """(start, stop) of the longest run of True in a 1-D bool array, bridging gaps of up
+    to `gap` False entries, or None."""
+    if not flags.any():
+        return None
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], flags.view(np.int8), [0]))))
+    starts, stops = edges[0::2], edges[1::2]
+    joined = np.flatnonzero(starts[1:] - stops[:-1] > gap)  # runs that stay separate
+    starts = starts[np.concatenate(([0], joined + 1))]
+    stops = stops[np.concatenate((joined, [len(stops) - 1]))]
+    i = int(np.argmax(stops - starts))
+    return int(starts[i]), int(stops[i])
+
+
+def _chroma(np, img, ch):
+    """Strongly coloured pixels: red, green, blue, cyan, magenta, yellow (6 of the 8
+    cell colours), which desktops rarely show over large areas."""
+    r, g, b = img[..., ch[0]], img[..., ch[1]], img[..., ch[2]]
+    return (np.maximum(np.maximum(r, g), b) > 160) & (np.minimum(np.minimum(r, g), b) < 96)
+
+
+def _dense_box(np, mask, gap):
+    """(y0, y1, x0, x1): the longest block of rows dense in mask, then of columns within
+    it. Lines count as dense from 35% of the densest one (75% of cells are coloured, but
+    a grid of few rows has columns with fewer by chance); `gap` sparse lines are bridged
+    (a scaled view blends colours at cell edges)."""
+    counts = mask.sum(1)
+    ys = _longest_run(np, counts > counts.max() * 0.35, gap) if counts.max() else None
+    if ys is None:
+        return None
+    counts = mask[ys[0]:ys[1]].sum(0)
+    xs = _longest_run(np, counts > counts.max() * 0.35, gap)
+    return xs and (ys[0], ys[1], xs[0], xs[1])
+
+
+def _ring_cuts(np, lum, chroma, edge, outward, lo, hi, cells):
+    """Cell boundaries along the timing ring beside one edge of the data area.
+
+    Axis 0 of lum and chroma crosses the ring: line `edge` is the first one outside the
+    data and `outward` (+1 or -1) leads away from it; lo:hi is the data area along axis
+    1. Returns the boundary positions, from lo to hi, or None if no clean ring with at
+    least `cells` cells is there (a window or the mouse pointer may cover it)."""
+    found = []
+    for step in range(GRID_MAX_CELL_PX + 3):
+        line = edge + outward * step
+        if not 0 <= line < lum.shape[0]:
+            break
+        seg = lum[line, lo:hi]
+        light = seg > 127
+        if (chroma[line, lo:hi].mean() < 0.05 and ((seg > 64) & (seg < 192)).mean() < 0.15
+                and np.count_nonzero(light[1:] != light[:-1]) >= 8):
+            found.append(line)
+        elif found or step >= 3:
+            break
+    if not found:
+        return None
+    a, b = max(0, lo - 3), min(lum.shape[1], hi + 3)
+    light = lum[found[len(found) // 2], a:b] > 127
+    cuts = np.flatnonzero(light[1:] != light[:-1]) + 1 + a
+    if len(cuts) <= cells:
+        return None
+    # The cuts nearest the data edges are its first and last boundary; anything beyond
+    # them is the outer edge of a ring cell (narrow in a scaled view) or the margin.
+    cuts = cuts[int(np.argmin(np.abs(cuts - lo))):int(np.argmin(np.abs(cuts - hi))) + 1]
+    if len(cuts) <= cells or abs(int(cuts[0]) - lo) > 2 or abs(int(cuts[-1]) - hi) > 2:
+        return None
+    gaps = np.diff(cuts)
+    gap = float(np.median(gaps))
+    if gap < 1.5 or np.abs(gaps - gap).max() > max(1.0, 0.35 * gap):
+        return None
+    return cuts
+
+
+class GridGeometry:
+    """Pixel coordinates of every cell centre of a grid (numpy int arrays). complete means
+    the bottom ring was seen too: a VNC viewer draws the first screen from the top down,
+    and a capture of it half-way would otherwise fix a grid with too few rows."""
+
+    def __init__(self, xs, ys, complete=True):
+        self.xs, self.ys, self.complete = xs, ys, complete
+        self.box = (int(xs[0]), int(ys[0]), int(xs[-1]) + 1, int(ys[-1]) + 1)  # x0, y0, x1, y1
+
+    def moved(self, dx, dy):
+        return GridGeometry(self.xs + dx, self.ys + dy, self.complete)
+
+    def within(self, box):
+        x, y, w, h = box
+        return x <= self.box[0] and y <= self.box[1] and self.box[2] <= x + w and self.box[3] <= y + h
+
+
+def locate_grid(np, img, ch):
+    """Find a grid in a capture of raw pixels (red, green, blue at byte indices ch).
+
+    The data area is the densest block of strongly coloured pixels; the timing rings
+    just outside it give every cell boundary, so a scaled VNC view (non-integer cell
+    size) still works. Top and left rings are read first, bottom and right ones when
+    something covers those. Returns GridGeometry in capture coordinates, or None."""
+    coarse = _dense_box(np, _chroma(np, img[::2, ::2], ch), 1)  # cells are at least 2 px wide
+    if coarse is None:
+        return None
+    pad = GRID_MAX_CELL_PX + 8
+    top, left = max(0, 2 * coarse[0] - pad), max(0, 2 * coarse[2] - pad)
+    crop = img[top:2 * coarse[1] + pad, left:2 * coarse[3] + pad]
+    chroma = _chroma(np, crop, ch)
+    box = _dense_box(np, chroma, 2)
+    if box is None:
+        return None
+    y0, y1, x0, x1 = box
+    if x1 - x0 < 64 or y1 - y0 < 12 or chroma[y0:y1, x0:x1].mean() < 0.55:
+        return None
+    lum = crop[..., ch[1]]
+    cols = GRID_MIN_COLS
+    xs = _ring_cuts(np, lum, chroma, y0 - 1, -1, x0, x1, cols)
+    bottom = _ring_cuts(np, lum, chroma, y1, 1, x0, x1, cols)
+    if xs is None:
+        xs = bottom
+    ys = _ring_cuts(np, lum.T, chroma.T, x0 - 1, -1, y0, y1, 3)
+    if ys is None:
+        ys = _ring_cuts(np, lum.T, chroma.T, x1, 1, y0, y1, 3)
+    if xs is None or ys is None:
+        return None
+    return GridGeometry((xs[:-1] + xs[1:]) // 2 + left, (ys[:-1] + ys[1:]) // 2 + top, bottom is not None)
+
+
+def read_grid_rows(np, img, xs, ys, ch):
+    """Sample each cell centre (3 bits: red, green, blue) and return every row's frame bytes."""
+    cells = img[np.ix_(ys, xs)]
+    bits = np.stack([cells[..., ch[0]] > 127, cells[..., ch[1]] > 127, cells[..., ch[2]] > 127], -1)
+    packed = np.packbits(bits.reshape(len(ys), -1), axis=1)
+    packed ^= np.frombuffer(grid_whitening(packed.shape[1], len(ys)), np.uint8).reshape(packed.shape)
+    nbytes = grid_row_bytes(len(xs))
+    return [row[:nbytes].tobytes() for row in packed]
+
+
+class QrReader:
+    """Frames from the QR codes in a grayscale capture."""
+
+    rgb = False
+    track_margin = None
+
+    def __init__(self, decoder):
+        self.decoder = decoder
+        self.name = "QR codes (%s)" % decoder.name
+
+    def clone(self):
+        return QrReader(type(self.decoder)())
+
+    def read(self, gray, box, full):
+        """Returns [(frame, bounding box on the screen or None)]."""
+        out = []
+        for text, pts in self.decoder.decode(gray):
+            try:
+                frame = parse_frame(text)
+            except ValueError:
+                continue
+            found = None
+            if pts:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                found = (box[0] + min(xs), box[1] + min(ys), box[0] + max(xs), box[1] + max(ys))
+            out.append((frame, found))
+        return out
+
+
+class GridReader:
+    """Frames from a colour grid. The geometry is found again on every full-screen
+    capture and reused for the cropped ones; rows whose CRC fails (torn, covered) are
+    skipped. Clones share the geometry."""
+
+    rgb = True
+    track_margin = GRID_MAX_CELL_PX + 8  # cropped captures keep the timing rings
+    name = "a colour grid"
+
+    RECHECK_EVERY = 0.5  # seconds between searches while the bottom ring is unseen
+
+    def __init__(self, np, channels, shared=None):
+        self.np, self.channels = np, channels
+        self.shared = {"geometry": None, "searched": 0.0} if shared is None else shared
+
+    def clone(self):
+        return GridReader(self.np, self.channels, self.shared)
+
+    def read(self, img, box, full):
+        geo = self.shared["geometry"]
+        located = (full or geo is None or not geo.complete
+                   and time.monotonic() - self.shared["searched"] >= self.RECHECK_EVERY)
+        if located:
+            geo = self._locate(img, box, geo)
+        out = self._rows(img, box, geo)
+        if not out and not located:  # the window may have moved: look again here
+            geo = self._locate(img, box, None)
+            out = self._rows(img, box, geo)
+        return out
+
+    def _locate(self, img, box, current):
+        """Search this capture; a complete grid found earlier is kept over a partial one."""
+        self.shared["searched"] = time.monotonic()
+        found = locate_grid(self.np, img, self.channels)
+        if found is None or current is not None and current.complete and not found.complete:
+            return current
+        found = self.shared["geometry"] = found.moved(box[0], box[1])
+        return found
+
+    def _rows(self, img, box, geo):
+        out = []
+        if geo is None or not geo.within(box):
+            return out
+        for raw in read_grid_rows(self.np, img, geo.xs - box[0], geo.ys - box[1], self.channels):
+            try:
+                out.append((parse_frame_bytes(raw), geo.box))
+            except ValueError:
+                pass
+        return out
+
+
+class AutoReader:
+    """Grid or QR codes, whichever the sender shows: full-screen captures try both,
+    cropped ones only the kind found last."""
+
+    rgb = True
+
+    def __init__(self, grid, qr, shared=None):
+        self.grid, self.qr = grid, qr
+        self.shared = {"mode": None} if shared is None else shared
+        self.name = grid.name + (" or " + qr.name if qr else "")
+
+    @property
+    def track_margin(self):
+        return self.grid.track_margin if self.shared["mode"] == "grid" else None
+
+    def clone(self):
+        return AutoReader(self.grid.clone(), self.qr and self.qr.clone(), self.shared)
+
+    def read(self, img, box, full):
+        mode = self.shared["mode"]
+        if full or mode != "qr":
+            found = self.grid.read(img, box, full)
+            if found:
+                self.shared["mode"] = "grid"
+                return found
+        if self.qr is None or not (full or mode != "grid"):
+            return []
+        found = self.qr.read(self.grid.np.ascontiguousarray(img[..., self.grid.channels[1]]), box, full)
+        if found:
+            self.shared["mode"] = "qr"
+        return found
+
+
 class RegionTracker:
     """Capture only the area around the codes, with periodic full-screen rescans."""
 
@@ -1432,7 +2066,7 @@ class RegionTracker:
             return (0, 0, self.width, self.height), True
         return self.region, False
 
-    def update(self, boxes):
+    def update(self, boxes, margin=None):
         now = time.monotonic()
         if not boxes:
             if self.region and now - self.last_seen > self.LOST_AFTER:
@@ -1443,7 +2077,8 @@ class RegionTracker:
         y0 = min(b[1] for b in boxes)
         x1 = max(b[2] for b in boxes)
         y1 = max(b[3] for b in boxes)
-        margin = max(24, max(b[2] - b[0] for b in boxes) // 6)
+        if margin is None:
+            margin = max(24, max(b[2] - b[0] for b in boxes) // 6)
         x0, y0 = max(0, x0 - margin), max(0, y0 - margin)
         x1, y1 = min(self.width, x1 + margin), min(self.height, y1 + margin)
         if self.region:
@@ -1496,50 +2131,47 @@ def default_decode_threads():
     return max(1, min(4, (os.cpu_count() or 1) - 1))
 
 
-def collect_from_screen(grabber, decoder, region=None, progress=None, timeout=None, threads=1):
+def collect_from_screen(grabber, reader, region=None, progress=None, timeout=None, threads=1):
     """Watch the screen until one transfer is complete; returns its FountainDecoder.
 
-    With threads > 1, up to that many captures are decoded at once (each thread with
-    its own decoder instance) while the next one is grabbed; XGetImage and the
-    decoders run without the GIL, so the screen is sampled several times faster.
+    reader is a QrReader, GridReader or AutoReader (a bare QR decoder is wrapped). With
+    threads > 1, up to that many captures are decoded at once (each thread with its own
+    reader clone) while the next one is grabbed; XGetImage, numpy and the QR decoders
+    run without the GIL, so the screen is sampled several times faster.
     """
     from concurrent.futures import ThreadPoolExecutor
     import queue
 
+    if not hasattr(reader, "read"):
+        reader = QrReader(reader)
     sessions = {}
     current = None
     tracker = RegionTracker(grabber.width, grabber.height, region)
     progress = progress or Progress()
     started = time.monotonic()
     idle = queue.Queue()
-    idle.put(decoder)
+    idle.put(reader)
     for _ in range(threads - 1):
-        idle.put(type(decoder)())
+        idle.put(reader.clone())
 
-    def decode(gray):
-        dec = idle.get()
+    def decode(img, box, full):
+        rd = idle.get()
         try:
-            return dec.decode(gray)
+            return rd.read(img, box, full)
         finally:
-            idle.put(dec)
+            idle.put(rd)
 
     pending = collections.deque()
     with ThreadPoolExecutor(threads) as pool:
         while True:
-            box, _ = tracker.next_box()
-            pending.append((box, pool.submit(decode, grabber.grab(*box))))
-            while pending and (len(pending) >= threads or pending[0][1].done()):
-                box, job = pending.popleft()
+            box, full = tracker.next_box()
+            img = grabber.grab(*box, colour=True) if reader.rgb else grabber.grab(*box)
+            pending.append(pool.submit(decode, img, box, full))
+            while pending and (len(pending) >= threads or pending[0].done()):
                 found = []
-                for text, pts in job.result():
-                    try:
-                        frame = parse_frame(text)
-                    except ValueError:
-                        continue
-                    if pts:
-                        xs = [p[0] for p in pts]
-                        ys = [p[1] for p in pts]
-                        found.append((box[0] + min(xs), box[1] + min(ys), box[0] + max(xs), box[1] + max(ys)))
+                for frame, where in pending.popleft().result():
+                    if where:
+                        found.append(where)
                     sess = sessions.get(frame.tid)
                     if sess is None:
                         sess = sessions[frame.tid] = FountainDecoder.for_frame(frame)
@@ -1549,7 +2181,7 @@ def collect_from_screen(grabber, decoder, region=None, progress=None, timeout=No
                         progress.update(sess, force=True)
                         progress.done()
                         return sess
-                tracker.update(found)
+                tracker.update(found, reader.track_margin)
             progress.update(current)
             if timeout is not None and time.monotonic() - started > timeout:
                 progress.done()
@@ -1584,6 +2216,26 @@ def _parse_density(text):
 
 
 def cmd_send(args):
+    codec = args.codec
+    if codec == "grid" and args.terminal:
+        raise QrxferError("--terminal draws QR codes only; drop --codec grid")
+    window = None
+    if codec != "qr" and not args.terminal:
+        try:  # fail before the passphrase prompt, not after it
+            window = X11GridWindow()
+        except QrxferError as exc:
+            if codec == "grid" or not (sys.stdin.isatty() and sys.stdout.isatty()):
+                raise
+            print("No X11 display (%s): showing QR codes in this terminal instead." % exc)
+            args.terminal = True
+    try:
+        return _send(args, window)
+    finally:
+        if window is not None:
+            window.close()
+
+
+def _send(args, window):
     archive, nfiles, nbytes = pack_paths(args.paths)
     secret, _ = obtain_passphrase(args, "send")
     blob = encrypt(archive, secret)
@@ -1606,8 +2258,26 @@ def cmd_send(args):
         print("Showing codes. Stop with q / Esc once the receiver reports completion.")
         return stream
 
-    runner = run_terminal_sender if args.terminal else run_tk_sender
-    state = runner(make_stream, args)
+    def make_grid_stream(avail_w, avail_h, px):
+        cols, rows = plan_cells(avail_w, avail_h, px)
+        block = grid_block_size(cols)
+        if block < GRID_MIN_BLOCK or rows < 3:
+            raise QrxferError("the %dx%d screen is too small for %d px grid cells; use a smaller "
+                              "--cell-px or --codec qr" % (avail_w, avail_h + GRID_STATUS_PX, px))
+        stream = GridStream(FountainEncoder(blob, block, tid), cols, rows)
+        print("  %d blocks of %d bytes, a %dx%d grid of %d px cells: %d rows = %s per screen"
+              % (stream.encoder.k, block, cols, rows, px, rows, human_size(rows * block)))
+        print("  about %s at %.1f fps if every row is captured"
+              % (human_time(stream.encoder.k / (rows * args.fps)), args.fps))
+        print("Showing the grid full screen. Stop with q / Esc (typed into the VNC viewer) "
+              "once the receiver reports completion.")
+        return stream
+
+    if window is not None:
+        state = run_x11_grid_sender(window, make_grid_stream, args)
+    else:
+        runner = run_terminal_sender if args.terminal else run_tk_sender
+        state = runner(make_stream, args)
     stream = state.stream
     print("Stopped after %d frames in %s." % (stream.seq, human_time(time.monotonic() - state.started)))
     if stream.seq < stream.encoder.k:
@@ -1650,16 +2320,29 @@ def cmd_recv(args):
     if os.environ.get("XDG_SESSION_TYPE") == "wayland":
         print("Warning: Wayland session - X11 capture may only see X11 windows.", file=sys.stderr)
     grabber = XlibGrabber()
-    decoder = open_qr_decoder(args.decoder)
+    decoder = None
+    if args.codec != "grid":
+        try:
+            decoder = open_qr_decoder(args.decoder)
+        except QrxferError as exc:
+            if args.codec == "qr":
+                raise
+            print("Note: QR codes cannot be read (%s); watching for grids only."
+                  % str(exc).split("\n")[0], file=sys.stderr)
+    if args.codec == "qr":
+        reader = QrReader(decoder)
+    else:
+        grid = GridReader(grabber.np, grabber.channels)
+        reader = grid if args.codec == "grid" else AutoReader(grid, decoder and QrReader(decoder))
     region = args.region
     if region and (region[0] + region[2] > grabber.width or region[1] + region[3] > grabber.height):
         raise QrxferError("region lies outside the %dx%d screen" % (grabber.width, grabber.height))
     secret, interactive = obtain_passphrase(args, "recv")
     outdir = os.path.abspath(args.output)
-    print("Watching the %dx%d screen with %s (Ctrl+C aborts). Keep the codes visible and unscaled."
-          % (grabber.width, grabber.height, decoder.name))
+    print("Watching the %dx%d screen for %s (Ctrl+C aborts). Keep the sender visible and unscaled."
+          % (grabber.width, grabber.height, reader.name))
     started = time.monotonic()
-    sess = collect_from_screen(grabber, decoder, region, timeout=args.timeout,
+    sess = collect_from_screen(grabber, reader, region, timeout=args.timeout,
                                threads=args.threads or default_decode_threads())
     elapsed = time.monotonic() - started
     blob = sess.result()
@@ -1700,6 +2383,39 @@ def _render_codes_image(np, codes, size, cols, px):
     return img
 
 
+def _selftest_grid(np, blob, rnd, report):
+    """Grid screens painted as the sender does, then found and read like a capture."""
+    cols, rows = plan_cells(960, 400, GRID_CELL_PX)
+    encoder = FountainEncoder(blob, grid_block_size(cols), rnd.getrandbits(32))
+    stream = GridStream(encoder, cols, rows)
+    painter = GridPainter(cols, rows, GRID_CELL_PX, lambda r, g, b: bytes((b, g, r, 0)))
+    sess = None
+    shown = used = 0
+    t = time.perf_counter()
+    stream.seq = encoder.k // 3
+    while (sess is None or not sess.complete) and shown < 6 * encoder.k + 40:
+        frames = stream.take(rows)
+        shown += rows
+        if np is not None:
+            pixels = np.frombuffer(painter.paint(frames), np.uint8).reshape(painter.height, painter.width, 4)
+            capture = np.full((painter.height + 50, painter.width + 70, 4), 40, np.uint8)
+            capture[20:20 + painter.height, 30:30 + painter.width] = pixels
+            geo = locate_grid(np, capture, (2, 1, 0))
+            frames = read_grid_rows(np, capture, geo.xs, geo.ys, (2, 1, 0)) if geo else []
+        for raw in frames:
+            if rnd.random() < 0.25:  # simulate rows lost to tearing
+                continue
+            frame = parse_frame_bytes(raw)
+            sess = sess or FountainDecoder.for_frame(frame)
+            used += 1
+            sess.add(frame)
+    good = sess is not None and sess.complete and sess.result() == blob
+    report("grid paint -> read -> fountain", good, "%d rows shown, %d used, %s, %.2f s"
+           % (shown, used, "located and read with numpy" if np is not None else "reading skipped",
+              time.perf_counter() - t))
+    return good
+
+
 def cmd_selftest(args):
     import random
 
@@ -1716,10 +2432,29 @@ def cmd_selftest(args):
         report("xz compression", True)
     else:
         report("xz compression", None, "missing, gzip will be used")
+    screen = (2560, 1440)
+    try:
+        window = X11GridWindow()
+        screen = (window.width, window.height)
+        window.close()
+        cols, rows = plan_cells(screen[0], screen[1] - GRID_STATUS_PX, GRID_CELL_PX)
+        report("X11 grid window", True, "%dx%d screen: %dx%d cells, %s per screen"
+               % (screen + (cols, rows, human_size(rows * grid_block_size(cols)))))
+    except QrxferError as exc:
+        report("X11 grid window", None, "%s - QR codes need --terminal or tkinter" % exc)
+    cols, rows = plan_cells(screen[0], screen[1] - GRID_STATUS_PX, GRID_CELL_PX)
+    stream = GridStream(FountainEncoder(os.urandom(rows * grid_block_size(cols)), grid_block_size(cols), 1),
+                        cols, rows)
+    painter = GridPainter(cols, rows, GRID_CELL_PX, lambda r, g, b: bytes((b, g, r, 0)))
+    t = time.perf_counter()
+    painter.paint(stream.take(rows))
+    spent = time.perf_counter() - t
+    report("grid painting speed", True, "%.0f ms per %dx%d screen (fps limit ~%.0f before the X server's share)"
+           % (spent * 1000, screen[0], screen[1], 1 / spent))
     if importlib.util.find_spec("tkinter"):
         report("tkinter window", True)
     else:
-        report("tkinter window", None, "missing - use 'send --terminal' or install python3-tk")
+        report("tkinter window", None, "missing - only needed for QR codes in a window (or use --terminal)")
     stream = FrameStream(FountainEncoder(os.urandom(12000), DENSITY["medium"], 1), "L")
     stream.take(1)  # build the cached version tables first
     t = time.perf_counter()
@@ -1795,6 +2530,8 @@ def cmd_selftest(args):
         report("QR encode -> decode -> fountain", good, "%d codes shown, %d used, %s, %.2f s"
                % (shown, decoded, how, time.perf_counter() - t))
         ok &= good
+        good = _selftest_grid(np, blob, rnd, report) and good
+        ok &= good
         if good:
             plain = decrypt(sess.result(), "selftest passphrase")
             out = os.path.join(tmp, "out")
@@ -1818,37 +2555,44 @@ def cmd_selftest(args):
 
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="qrxfer", description="Encrypted file transfer through animated QR codes on screen.",
+        prog="qrxfer", description="Encrypted file transfer through an animated colour grid or QR codes on screen.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Typical use with VNC:\n"
                "  local:   qrxfer recv            (press Enter to generate a passphrase)\n"
-               "  remote:  qrxfer send FILES...   (type that passphrase, codes appear)\n"
+               "  remote:  qrxfer send FILES...   (type that passphrase, the grid appears)\n"
                "Details: qrxfer COMMAND --help")
     p.add_argument("--version", action="version", version="qrxfer " + __version__)
     sub = p.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
 
-    s = sub.add_parser("send", help="show files as animated QR codes")
+    s = sub.add_parser("send", help="show files as an animated colour grid or QR codes")
     s.add_argument("paths", nargs="+", metavar="FILE_OR_DIR")
     s.add_argument("-p", "--passphrase-file", metavar="FILE", help="read the passphrase from FILE")
+    s.add_argument("--codec", choices=["auto", "grid", "qr"], default="auto",
+                   help="grid: full-screen colour grid (X11, fastest); qr: QR codes in a Tk window or "
+                        "with --terminal; auto (default): grid, or terminal QR codes without an X display")
     s.add_argument("--fps", type=float, default=12.0,
-                   help="code changes per second (default 12; +/- keys adjust live)")
+                   help="screens per second (default 12; +/- keys adjust live)")
+    s.add_argument("--cell-px", type=int, choices=range(2, GRID_MAX_CELL_PX + 1), default=GRID_CELL_PX,
+                   metavar="N", help="grid: cell size in pixels (default %d)" % GRID_CELL_PX)
     s.add_argument("--density", type=_parse_density, default=None,
-                   help="data per code: auto (default: the code size that carries the most per screen), "
+                   help="QR: data per code: auto (default: the code size that carries the most per screen), "
                         "low, medium, high or bytes (300/600/1000)")
     s.add_argument("--grid", type=_parse_grid, default=None,
-                   help="codes per screen: auto (default) or COLSxROWS, e.g. 6x2 (1 = one big code); "
+                   help="QR: codes per screen: auto (default) or COLSxROWS, e.g. 6x2 (1 = one big code); "
                         "with --density auto the codes are sized to fill that grid")
-    s.add_argument("--max-codes", type=int, default=24, help="upper limit for --grid auto (default 24)")
-    s.add_argument("--min-px", type=int, default=4, help="smallest module size in pixels for --grid auto (default 4)")
+    s.add_argument("--max-codes", type=int, default=24, help="QR: upper limit for --grid auto (default 24)")
+    s.add_argument("--min-px", type=int, default=4, help="QR: smallest module size in pixels for --grid auto (default 4)")
     s.add_argument("--ecc", choices=list(QR_LEVELS), default="L", help="QR error correction level (default L)")
-    s.add_argument("--terminal", action="store_true", help="draw codes in this terminal instead of a window")
-    s.add_argument("--windowed", action="store_true", help="use a normal window instead of full screen")
+    s.add_argument("--terminal", action="store_true", help="QR: draw codes in this terminal instead of a window")
+    s.add_argument("--windowed", action="store_true", help="QR: use a normal window instead of full screen")
     s.set_defaults(func=cmd_send)
 
     r = sub.add_parser("recv", help="capture the screen and receive files")
     r.add_argument("-o", "--output", default=".", help="directory for received files (default: current)")
     r.add_argument("-p", "--passphrase-file", metavar="FILE", help="read the passphrase from FILE")
+    r.add_argument("--codec", choices=["auto", "grid", "qr"], default="auto",
+                   help="what to look for: auto (default) finds a colour grid or QR codes")
     r.add_argument("--decoder", choices=["auto"] + sorted(QR_DECODERS), default="auto",
                    help="QR decoder library (default: zxing-cpp if installed, else zbar)")
     r.add_argument("--region", type=_parse_region, help="only watch X,Y,WIDTH,HEIGHT of the screen")

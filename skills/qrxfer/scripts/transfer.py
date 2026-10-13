@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic helpers for an agent-operated VNC/QR download (stdlib, Python 3.6+)."""
+"""Deterministic helpers for an agent-operated qrxfer download over VNC (stdlib, Python 3.6+)."""
 
 import argparse
 import base64
@@ -45,21 +45,36 @@ def prepare(args):
     address = server_address(args.server)
     if not os.path.isabs(args.source) or args.source == '/':
         raise ValueError('Provide a remote absolute path other than /')
+    if args.script is not None and not (os.path.isabs(args.script) and args.script != '/'):
+        raise ValueError('Provide the remote qrxfer script as an absolute path')
     project = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.realpath(__file__)))))
     work = tempfile.mkdtemp(prefix='qrxfer-download-')
     os.chmod(work, 0o700)
     remote = '/tmp/qrxfer-download-' + uuid.uuid4().hex
+    local_qrxfer = os.path.join(project, 'qrxfer.py')
+    # With an existing remote script only the helper has to be typed in.
+    sources = [('transfer.py', os.path.realpath(__file__))]
+    if args.script is None:
+        sources.insert(0, ('qrxfer.py', local_qrxfer))
     payload = {}
-    for name, path in [('qrxfer.py', os.path.join(project, 'qrxfer.py')),
-                       ('transfer.py', os.path.realpath(__file__))]:
+    for name, path in sources:
         with open(path, 'rb') as source:
             content = source.read()
         payload[name] = [base64.b64encode(content).decode('ascii'),
                          hashlib.sha256(content).hexdigest()]
     encoded = base64.b64encode(zlib.compress(json.dumps(payload).encode('ascii'), 9))
-    bootstrap = """import base64,hashlib,json,os,zlib
+    # An existing script is only read, never run, and before anything is created:
+    # a wrong path fails without leaving a remote directory behind.
+    bootstrap = """import base64,hashlib,json,os,re,zlib
 d=%r
+s=%r
+if s:
+    with open(s,'rb') as f:
+        q=f.read()
+    v=re.search(br'^__version__ = "([^"]+)"',q,re.M)
+    print('QRXFER_SCRIPT version=%%s grid=%%s sha256=%%s'%%(v.group(1).decode('ascii') if v else '?',
+          'yes' if b'--codec' in q else 'no',hashlib.sha256(q).hexdigest()))
 p=json.loads(zlib.decompress(base64.b64decode(%r)).decode('ascii'))
 os.mkdir(d,0o700)
 for name,(encoded,digest) in p.items():
@@ -68,20 +83,24 @@ for name,(encoded,digest) in p.items():
     with open(os.path.join(d,name),'xb') as f:
         f.write(data)
 print('QRXFER_READY '+d)
-""" % (remote, encoded.decode('ascii'))
+""" % (remote, args.script, encoded.decode('ascii'))
     # Keep every generated shell command on one line for VNC keyboard delivery.
     bootstrap = python_command('exec(%r)' % bootstrap)
     helper = shlex.quote(remote + '/transfer.py')
     bundle = 'python3 %s bundle --source %s --output %s' % (
         helper, shlex.quote(args.source), shlex.quote(remote))
-    send = 'python3 %s send %s %s --terminal --fps 20' % (
-        shlex.quote(remote + '/qrxfer.py'), shlex.quote(remote + '/payload.tar.xz'),
+    send = 'python3 %s send %s %s --fps 20' % (
+        shlex.quote(args.script or remote + '/qrxfer.py'), shlex.quote(remote + '/payload.tar.xz'),
         shlex.quote(remote + '/manifest.json'))
+    # Fallback when the colour grid cannot be shown or read: QR codes in the terminal.
+    # Plain --terminal also works with qrxfer versions that predate the grid.
+    send_qr = send + ' --terminal'
     cleanup = python_command("import os,shutil;p=%r;assert os.path.isdir(p) "
                              "and not os.path.islink(p);shutil.rmtree(p);"
                              "print('QRXFER_CLEANUP_OK')" % remote)
-    for name, command in [('bootstrap', bootstrap), ('bundle', bundle),
-                           ('send', send), ('cleanup', cleanup)]:
+    # quit.txt is the key that stops a sender (typed without Enter).
+    for name, command in [('bootstrap', bootstrap), ('bundle', bundle), ('send', send),
+                           ('send_qr', send_qr), ('quit', 'q'), ('cleanup', cleanup)]:
         with open(os.path.join(work, name + '.txt'), 'w') as out:
             out.write(command)
     with open(os.path.join(work, 'passphrase.txt'), 'w') as out:
@@ -89,7 +108,8 @@ print('QRXFER_READY '+d)
     os.chmod(os.path.join(work, 'passphrase.txt'), 0o600)
     os.mkdir(os.path.join(work, 'received'))
     context = dict(address, source=args.source, dest=os.path.abspath(os.path.expanduser(args.dest)),
-                   work=work, remote_work=remote, project=project)
+                   work=work, remote_work=remote, project=project, script=args.script,
+                   qrxfer_sha256=file_hash(local_qrxfer))
     write_json(os.path.join(work, 'context.json'), context)
     print(json.dumps(context, indent=2))
 
@@ -102,12 +122,16 @@ def type_file(args):
         content = source.read()
     if b'\n' in content or b'\r' in content:
         raise ValueError('Input files must contain one line without a newline')
+    # xdotool uses XTEST only while the target window has the focus and falls back
+    # to synthetic events otherwise, which VNC viewers ignore: focus it first, and
+    # keys after a focus change are dropped instead of reaching another window.
+    subprocess.check_call(['xdotool', 'windowfocus', '--sync', str(args.window)])
     subprocess.check_call(['xdotool', 'type', '--window', str(args.window),
                            '--clearmodifiers', '--delay', '1', '--file', args.file])
     if args.enter:
         subprocess.check_call(['xdotool', 'key', '--window', str(args.window),
                                '--clearmodifiers', 'Return'])
-    print('Input delivered to VNC window %s.' % args.window)
+    print('Keys sent to VNC window %s; check the remote screen.' % args.window)
 
 
 def paths_in(root):
@@ -315,6 +339,8 @@ def main():
     p.add_argument('--server', required=True)
     p.add_argument('--source', required=True)
     p.add_argument('--dest', required=True)
+    p.add_argument('--script', help='qrxfer already on the remote (absolute path); '
+                   'only the helper is installed then')
     p.set_defaults(run=prepare)
     p = commands.add_parser('type', help='type one file into a specific VNC window')
     p.add_argument('--window', type=int, required=True)

@@ -8,6 +8,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -67,6 +68,154 @@ class FrameTest(unittest.TestCase):
         self.assertEqual(q.FRAME_OVERHEAD, 21)
 
 
+class GridFormatTest(unittest.TestCase):
+    def test_wire_format_is_stable(self):
+        # Changing these breaks compatibility between qrxfer copies on two machines.
+        self.assertEqual(q.plan_cells(2560, 1333, 3), (849, 439))
+        self.assertEqual(q.grid_block_size(849), 297)
+        self.assertEqual(q.grid_whitening(4, 2).hex(), "81b3d07deb4eb7ae")
+        self.assertEqual(q.grid_row_digits(bytes(range(37)), 99, 1),
+                         "21354774664077066637547350227415465572125712571046337573162"
+                         "1430342700641265004755261375036701753427")
+        frame = q.FountainEncoder(bytes(range(200)), 100, 0xC0FFEE).frame(1)
+        raw = q.frame_bytes(frame)
+        self.assertEqual(raw[:21].hex(), "0100c0ffee000000c8006400000001000164656667")
+        self.assertEqual(q.b45decode(q.pack_frame(frame)[3:-1]), raw)  # QR codes carry the same bytes
+        self.assertEqual(q.parse_frame_bytes(raw).payload, frame.payload)
+
+    def test_painter_colours_and_ring(self):
+        painter = q.GridPainter(3, 1, 2, lambda r, g, b: bytes((r, g, b, 0)))
+        rows = [bytes(1)]
+        digits = q.grid_row_digits(rows[0], 3, 0)
+        px = painter.paint(rows)
+        self.assertEqual((painter.width, painter.height, len(px)), (10, 6, 10 * 6 * 4))
+
+        def cell(x, y):
+            o = (2 * y * 10 + 2 * x) * 4
+            return px[o:o + 3]
+        white, black = b"\xff\xff\xff", b"\x00\x00\x00"
+        self.assertEqual([cell(x, 0) for x in range(5)], [white, black, white, black, white])
+        self.assertEqual([cell(0, 1), cell(4, 1), cell(0, 2)], [black, black, white])
+        for x, d in enumerate(digits, 1):
+            s = int(d)
+            self.assertEqual(cell(x, 1), bytes((255 * (s >> 2), 255 * (s >> 1 & 1), 255 * (s & 1))))
+
+
+def render_grid_screen(np, frames, cols, rows, px=3):
+    """A grid as GridPainter draws it, in BGRX bytes like XGetImage returns."""
+    painter = q.GridPainter(cols, rows, px, lambda r, g, b: bytes((b, g, r, 0)))
+    return np.frombuffer(painter.paint(frames), np.uint8).reshape(painter.height, painter.width, 4).copy()
+
+
+def place_on_desktop(np, grid, top=40, left=70):
+    """Put a grid on a busy desktop: grey wallpaper with saturated icons and black margins."""
+    rnd = np.random.RandomState(1)
+    h, w = grid.shape[:2]
+    screen = np.full((h + top + 90, w + left + 110, 4), 128, np.uint8)
+    screen[..., 0] = 200  # bluish wallpaper
+    for _ in range(12):  # small coloured icons
+        y, x = rnd.randint(0, screen.shape[0] - 24), rnd.randint(0, screen.shape[1] - 24)
+        screen[y:y + 24, x:x + 24, :3] = rnd.randint(0, 2, 3) * 255
+    screen[top - 6:top + h + 6, left - 6:left + w + 6] = 0
+    screen[top:top + h, left:left + w] = grid
+    return screen
+
+
+@unittest.skipUnless(HAVE_NUMPY, "numpy missing")
+class GridReadTest(unittest.TestCase):
+    CH = (2, 1, 0)
+
+    def setUp(self):
+        import numpy as np
+        self.np = np
+        self.cols, self.rows = q.plan_cells(1200, 640, 3)
+        self.enc = q.FountainEncoder(os.urandom(60000), q.grid_block_size(self.cols), 99)
+        self.stream = q.GridStream(self.enc, self.cols, self.rows)
+
+    def read(self, screen, expect_rows=None):
+        geo = q.locate_grid(self.np, screen, self.CH)
+        self.assertIsNotNone(geo)
+        self.assertEqual((len(geo.xs), len(geo.ys)), (self.cols, expect_rows or self.rows))
+        return q.read_grid_rows(self.np, screen, geo.xs, geo.ys, self.CH)
+
+    def test_paint_locate_read(self):
+        frames = self.stream.take(self.rows)
+        screen = place_on_desktop(self.np, render_grid_screen(self.np, frames, self.cols, self.rows))
+        self.assertEqual(self.read(screen), frames)
+        screen[10:32] = (230, 80, 0, 0)  # a saturated blue title bar 8 px above the grid
+        self.assertEqual(self.read(screen), frames)
+        self.assertIsNone(q.locate_grid(self.np, place_on_desktop(self.np, screen[:0, :0]), self.CH))
+
+    def test_spare_last_column_located(self):
+        # 849 columns carry 318 bytes and 3 spare bits: the whole last column is spare,
+        # but whitening colours it like the others, so the grid is found with all of it.
+        enc = q.FountainEncoder(bytes(random.Random(4).getrandbits(8) for _ in range(9000)),
+                                q.grid_block_size(849), 4)
+        frames = q.GridStream(enc, 849, 41).take(41)
+        geo = q.locate_grid(self.np, place_on_desktop(self.np, render_grid_screen(self.np, frames, 849, 41)),
+                            self.CH)
+        self.assertEqual((len(geo.xs), len(geo.ys)), (849, 41))
+
+    def test_zero_padding_still_located(self):
+        # A short last block is mostly zero padding; whitening keeps its rows coloured.
+        enc = q.FountainEncoder(b"\x01", q.grid_block_size(self.cols), 3)
+        frames = [q.frame_bytes(enc.frame(0))] * self.rows
+        screen = place_on_desktop(self.np, render_grid_screen(self.np, frames, self.cols, self.rows))
+        self.assertEqual(self.read(screen), frames)
+
+    def test_covered_rings_and_torn_rows(self):
+        np = self.np
+        a, b = self.stream.take(self.rows), self.stream.take(self.rows)
+        new, old = render_grid_screen(np, b, self.cols, self.rows), render_grid_screen(np, a, self.cols, self.rows)
+        torn = old.copy()
+        torn[:150] = new[:150]                    # a redraw that reached data row 48 (y 147..149)
+        torn[150:153, :600] = new[150:153, :600]  # ... and half of row 49
+        screen = place_on_desktop(np, torn)
+        screen[-160:-40, -260:-60] = (90, 90, 90, 0)  # a widget over the bottom right corner
+        rows = self.read(screen)
+        self.assertEqual(rows[:49], b[:49])
+        self.assertNotIn(rows[49], (a[49], b[49]))
+        with self.assertRaises(ValueError):
+            q.parse_frame_bytes(rows[49])
+        self.assertEqual(rows[50:150], a[50:150])
+        # A mouse pointer over the left ring: the right ring gives the rows instead.
+        screen = place_on_desktop(np, new)
+        screen[40 + 90:40 + 110, 66:84] = (230, 230, 230, 0)
+        self.assertEqual(self.read(screen)[:28], b[:28])
+
+    def test_half_drawn_first_screen(self):
+        # A VNC viewer draws the first screen from the top down; a capture half-way must
+        # not fix a grid with too few rows.
+        np = self.np
+        frames = self.stream.take(self.rows)
+        grid = render_grid_screen(np, frames, self.cols, self.rows)
+        full = place_on_desktop(np, grid)
+        half = full.copy()
+        half[40 + 300:40 + grid.shape[0]] = (200, 128, 128, 0)  # still the wallpaper
+        geo = q.locate_grid(np, half, self.CH)
+        self.assertFalse(geo.complete)
+        self.assertEqual(len(geo.ys), 99)
+        reader = q.GridReader(np, self.CH)
+        box = (0, 0, full.shape[1], full.shape[0])
+        self.assertEqual(len(reader.read(half, box, False)), 99)
+        self.assertEqual(len(reader.read(full, box, False)), 99)  # not searched again yet
+        reader.shared["searched"] -= reader.RECHECK_EVERY
+        self.assertEqual([f.seq for f, _ in reader.read(full, box, False)],
+                         [q.parse_frame_bytes(raw).seq for raw in frames])
+        self.assertTrue(reader.shared["geometry"].complete)
+
+    def test_scaled_views(self):
+        np = self.np
+        frames = self.stream.take(self.rows)
+        grid = render_grid_screen(np, frames, self.cols, self.rows)
+        for scale in (1.25, 0.8, 4 / 3.0):
+            h, w = grid.shape[:2]
+            ys = (np.arange(int(h * scale)) / scale).astype(int)
+            xs = (np.arange(int(w * scale)) / scale).astype(int)
+            scaled = np.ascontiguousarray(grid[ys][:, xs])
+            self.assertEqual(self.read(place_on_desktop(np, scaled)), frames, scale)
+
+
 class FountainTest(unittest.TestCase):
     def transfer(self, k, block, loss, start, seed):
         rnd = random.Random(seed)
@@ -92,6 +241,48 @@ class FountainTest(unittest.TestCase):
                 received = self.transfer(k, 40, loss, start, seed=k * 31 + start)
                 if k >= 64:
                     self.assertLess(received, k * 1.1 + 5)
+
+    def test_many_blocks_fast(self):
+        # A grid carries tens of thousands of blocks: a 3% gap after the first pass must
+        # close quickly, and a receiver started late must catch up through the repeated
+        # systematic frames.
+        blob = os.urandom(9000 * 16 - 7)
+        enc = q.FountainEncoder(blob, 16, 21)
+        self.assertEqual(q.grid_block_size(99), 16)
+        rnd = random.Random(5)
+        for late in (False, True):
+            stream = q.GridStream(enc, 99, 300)
+            if late:
+                stream.take(300)
+                stream.seq = enc.k + 7
+            dec, shown, started = None, 0, time.monotonic()
+            while dec is None or not dec.complete:
+                for raw in stream.take(300):
+                    if rnd.random() < 0.03:
+                        continue
+                    frame = q.parse_frame_bytes(raw)
+                    dec = dec or q.FountainDecoder.for_frame(frame)
+                    dec.add(frame)
+                shown += 300
+                self.assertLess(shown, 3 * enc.k, late)
+            self.assertEqual(dec.result(), blob)
+            self.assertLess(time.monotonic() - started, 30, late)
+            if not late:
+                self.assertLess(shown, 1.2 * enc.k)
+
+    def test_repair_only_after_heavy_loss(self):
+        # Skipping heavy repair frames must stop when no systematic frames follow (QR codes).
+        enc = q.FountainEncoder(os.urandom(300 * 20), 20, 3)
+        dec = q.FountainDecoder.for_frame(enc.frame(0))
+        dec.SKIP_MIN_K = 0
+        for seq in range(0, enc.k, 2):
+            dec.add(enc.frame(seq))
+        seq = enc.k
+        while not dec.complete:
+            dec.add(enc.frame(seq))
+            seq += 1
+            self.assertLess(seq, enc.k + q.FountainDecoder.SKIP_WINDOW + 4 * enc.k)
+        self.assertEqual(dec.received, enc.k // 2 + seq - enc.k - q.FountainDecoder.SKIP_WINDOW)
 
     def test_other_transfer_rejected(self):
         a = q.FountainEncoder(b"a" * 100, 10, 1)
@@ -362,7 +553,77 @@ class ReceivePipelineTest(unittest.TestCase):
             self.assertEqual(fh.read(), data)
 
 
+class FakeGridGrabber:
+    """Pretends to be the screen with the sender's grid on it, in BGRX like XGetImage."""
+
+    channels = (2, 1, 0)
+
+    def __init__(self, np, stream, every=3):
+        self.np, self.stream, self.every = np, stream, every
+        self.calls = 0
+        self.screen = None
+        self.width = self.height = None
+        self.grab(0, 0, 1, 1, colour=True)
+        self.calls = 0
+
+    def grab(self, left, top, width, height, colour=False):
+        if self.calls % self.every == 0:  # the screen changes every few captures
+            frames = self.stream.take(self.stream.rows)
+            self.screen = place_on_desktop(self.np, render_grid_screen(self.np, frames, self.stream.cols,
+                                                                       self.stream.rows))
+            self.height, self.width = self.screen.shape[:2]
+        self.calls += 1
+        region = self.screen[top:top + height, left:left + width]
+        return region if colour else self.np.ascontiguousarray(region[..., 1])
+
+
+class ColourGrabber:
+    """Shows a grayscale FakeGrabber's screen in colour, as AutoReader captures it."""
+
+    channels = (2, 1, 0)
+
+    def __init__(self, gray):
+        self.gray, self.width, self.height = gray, gray.width, gray.height
+
+    def grab(self, left, top, width, height, colour=False):
+        return self.gray.np.repeat(self.gray.grab(left, top, width, height)[..., None], 4, axis=2)
+
+
+@unittest.skipUnless(HAVE_NUMPY, "numpy missing")
+class GridReceivePipelineTest(unittest.TestCase):
+    def test_collect_grid_and_qr_automatically(self):
+        import numpy as np
+        blob = q.encrypt(os.urandom(150000), "pw")
+        cols, rows = q.plan_cells(900, 500, 3)
+        for threads in (1, 3):
+            stream = q.GridStream(q.FountainEncoder(blob, q.grid_block_size(cols), 77 + threads), cols, rows)
+            stream.seq = 200  # receiver started late
+            grabber = FakeGridGrabber(np, stream)
+            reader = q.AutoReader(q.GridReader(np, grabber.channels), None)
+            sess = q.collect_from_screen(grabber, reader, progress=q.Progress(io.StringIO()),
+                                         timeout=60, threads=threads)
+            self.assertEqual(sess.result(), blob)
+            self.assertEqual(reader.shared["mode"], "grid")
+        decoders = available_decoders()
+        if decoders:  # the same reader also finds QR codes
+            stream = q.FrameStream(q.FountainEncoder(blob[:20000], 500, 5), "L")
+            grabber = ColourGrabber(FakeGrabber(np, stream, cols=3, px=3))
+            reader = q.AutoReader(q.GridReader(np, grabber.channels), q.QrReader(decoders[0]))
+            sess = q.collect_from_screen(grabber, reader, progress=q.Progress(io.StringIO()), timeout=60)
+            self.assertEqual(sess.result(), blob[:20000])
+            self.assertEqual(reader.shared["mode"], "qr")
+
+
 class CliTest(unittest.TestCase):
+    def test_send_codec_conflicts(self):
+        err = io.StringIO()
+        old, sys.stderr = sys.stderr, err
+        try:
+            self.assertEqual(q.main(["send", "--codec", "grid", "--terminal", "x"]), 1)
+        finally:
+            sys.stderr = old
+        self.assertIn("--terminal draws QR codes only", err.getvalue())
+
     def test_genpass(self):
         out = io.StringIO()
         old, sys.stdout = sys.stdout, out

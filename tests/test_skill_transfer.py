@@ -7,6 +7,7 @@ import io
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -138,7 +139,7 @@ class SkillTransferTest(unittest.TestCase):
         captured = io.StringIO()
         with contextlib.redirect_stdout(captured):
             transfer.prepare(argparse.Namespace(server='192.0.2.1:69', source=str(self.source),
-                                                 dest=str(self.dest)))
+                                                 dest=str(self.dest), script=None))
         context = json.loads(captured.getvalue())
         local, remote = pathlib.Path(context['work']), pathlib.Path(context['remote_work'])
         try:
@@ -158,6 +159,50 @@ class SkillTransferTest(unittest.TestCase):
             shutil.rmtree(str(local))
             if remote.exists():
                 shutil.rmtree(str(remote))
+
+    def prepare_with_script(self, script):
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            transfer.prepare(argparse.Namespace(server='192.0.2.1', source=str(self.source),
+                                                 dest=str(self.dest), script=script))
+        context = json.loads(captured.getvalue())
+        local, remote = pathlib.Path(context['work']), pathlib.Path(context['remote_work'])
+        self.addCleanup(shutil.rmtree, str(local))
+        self.addCleanup(shutil.rmtree, str(remote), True)
+        run = subprocess.run(['sh', '-c', (local / 'bootstrap.txt').read_text()],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        return context, local, remote, run
+
+    def test_prepare_with_an_existing_remote_script(self):
+        installed = self.root / 'bin dir/qrxfer'
+        installed.parent.mkdir()
+        shutil.copy(str(PROJECT / 'qrxfer.py'), str(installed))
+        context, local, remote, run = self.prepare_with_script(str(installed))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(context['script'], str(installed))
+        self.assertEqual(context['qrxfer_sha256'], transfer.file_hash(str(PROJECT / 'qrxfer.py')))
+        self.assertIn('QRXFER_SCRIPT version=%s grid=yes sha256=%s\n' % (
+            qrxfer.__version__, context['qrxfer_sha256']), run.stdout)
+        self.assertTrue(run.stdout.endswith('QRXFER_READY %s\n' % remote))
+        self.assertEqual(sorted(os.listdir(str(remote))), ['transfer.py'])  # only the helper is typed in
+        for name in ('send', 'send_qr'):
+            command = shlex.split((local / (name + '.txt')).read_text())
+            self.assertEqual(command[:3], ['python3', str(installed), 'send'])
+        self.assertEqual(installed.read_bytes(), (PROJECT / 'qrxfer.py').read_bytes())
+
+        # A version from before the grid: reported, and send_qr.txt needs no --codec.
+        installed.write_text('__version__ = "1.0.0"\nprint("qr only")\n')
+        context, local, remote, run = self.prepare_with_script(str(installed))
+        self.assertIn('QRXFER_SCRIPT version=1.0.0 grid=no sha256=', run.stdout)
+        self.assertNotIn('--codec', (local / 'send_qr.txt').read_text())
+        self.assertTrue((local / 'send_qr.txt').read_text().endswith(' --fps 20 --terminal'))
+
+        context, local, remote, run = self.prepare_with_script(str(self.root / 'missing'))
+        self.assertNotEqual(run.returncode, 0)
+        self.assertNotIn('QRXFER_READY', run.stdout)
+        self.assertFalse(remote.exists())
+        with self.assertRaisesRegex(ValueError, 'absolute'):
+            self.prepare_with_script('bin/qrxfer')
 
 
 if __name__ == '__main__':
