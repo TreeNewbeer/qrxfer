@@ -2,7 +2,7 @@
 name: qrxfer
 description: Download files or folders from a remote Linux VNC desktop using qrxfer's animated colour grid (QR codes as a fallback). Use for /qrxfer server password source-path dest-path (or labelled: script:remote-qrxfer source:path dest:path), or an explicit request to copy from a VNC server through qrxfer.
 metadata:
-  version: "1.1.0"
+  version: "1.1.1"
 ---
 
 # qrxfer
@@ -61,12 +61,18 @@ python3 SKILL_DIR/scripts/transfer.py type --window WINDOW_ID --file INPUT_FILE 
    - If the remote has no usable X11 display (the sender reports an error), or the receiver finds no grid although the whole remote screen is visible, stop the sender and use send_qr.txt instead: QR codes in the terminal, about 30 times slower. Before starting it, maximize the terminal and shrink its font so each module is about 4–5 pixels (character cells of about 5×10 pixels); --density auto chooses the code size from the terminal size at start. Record every font zoom step and undo them in reverse when done; never hard-code the zoom count from some earlier window.
 5. Start qrxfer recv locally: output to received under this run's work, use passphrase.txt from work, capture the verified visible area of the VNC window, and keep stdout/stderr in this run's recv.log. The visible area comes from this run's window geometry, never from historical coordinates; keep the window visible and uncovered. Set a reasonable timeout, keep watching the receive progress, and report the status of long transfers to the user. The receiver detects the grid or QR codes by itself.
 6. Type send.txt (or send_qr.txt) on the remote side. When the Passphrase prompt appears, type this run's passphrase.txt with helper type; type it again only **after the Repeat passphrase prompt appears**. getpass flushes keystrokes sent in advance, so the passphrase cannot be typed twice in one go. The transfer passphrase is not echoed; do not capture or print the passphrase file.
-7. Wait until the local receiver exits with 0 and shows that both files were saved. If progress stalls, check first for covered windows, a cut or scaled remote screen, the code size, VNC screen updates and the decoding log; the fountain code makes up for lost frames, so there is no need to start over at once. If a script whose sha256 differs from qrxfer_sha256 shows codes but the receiver never decodes a frame, its format may be incompatible: stop it and fall back as in step 1. On interruption or decryption failure, keep the raw receive log and the recoverable encrypted file, and never deliver a partial result as the complete directory.
+7. Wait until the local receiver exits with 0 and shows that both files were saved. Once recv.log shows `All … blocks arrived`, the sender is no longer needed; reassembling and decrypting hundreds of MB can take a few more minutes. If progress stalls, check first for a screensaver on either side (screenshot the VNC window; check that keepawake is still running), covered windows, a cut or scaled remote screen, the code size, VNC screen updates and the decoding log; the fountain code makes up for lost frames, so there is no need to start over at once. If a script whose sha256 differs from qrxfer_sha256 shows codes but the receiver never decodes a frame, its format may be incompatible: stop it and fall back as in step 1. On interruption or decryption failure, keep the raw receive log and the recoverable encrypted file, and never deliver a partial result as the complete directory.
 
-The local receive command looks like this; WORK and the region coordinates must be replaced with this run's actual values, and the timeout adjusted to the compressed size and receive rate for long transfers:
+The local receive command looks like this; WORK and the region coordinates must be replaced with this run's actual values, and the timeout adjusted to the compressed size and receive rate for long transfers. The timeout counts from the start of recv, so it also covers the time the sender spends compressing and encrypting before the grid appears; for hundreds of MB, allow at least 5 minutes per 100 MB of compressed size on top of that:
 
 ```text
 python3 REPO/qrxfer.py recv -o WORK/received -p WORK/passphrase.txt --region X,Y,W,H --timeout 900 > WORK/recv.log 2>&1
+```
+
+Right after starting recv, start helper keepawake in the background with the verified VNC window ID and the receiver's PID, and keep its output in this run's keepawake.log. Screensavers on both sides count idle time from the last key typed through the viewer, so in a transfer longer than their timeout (often 10–30 minutes) they cover the grid and the receiver stalls. Every 4 minutes keepawake tells a local xscreensaver to deactivate and moves the pointer into the corner of the VNC window and back; the viewer forwards that motion to the remote. It never types keys, because q stops the grid sender, and it exits by itself once the receiver has exited:
+
+```text
+python3 SKILL_DIR/scripts/transfer.py keepawake --window WINDOW_ID --pid RECV_PID > WORK/keepawake.log 2>&1
 ```
 
 ## Verification, saving and cleanup

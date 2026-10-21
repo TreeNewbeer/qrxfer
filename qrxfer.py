@@ -39,7 +39,7 @@ import time
 import unicodedata
 import zlib
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 
 class QrxferError(Exception):
@@ -251,27 +251,41 @@ class FountainDecoder:
 
     Blocks known on their own (systematic frames, or equations solved down to one
     block) are kept as values only. Other equations are a bitmask of the still-missing
-    block indices plus the XOR of those blocks (both Python ints), kept in echelon form
-    keyed by their lowest set bit, so `rank` is exact progress: the data is complete
-    when rank == k. Known blocks are substituted into repair frames before elimination:
+    blocks plus the XOR of those blocks (both Python ints), kept in echelon form keyed
+    by their highest set bit, so `rank` is exact progress: the data is complete when
+    rank == k. Known blocks are substituted into repair frames before elimination:
     rows that kept every block would make each later repair frame cascade through all
     of them (with tens of thousands of blocks and a few percent missing, ~0.1 s per
     frame), and a bitmask per known block would need ~k*k/16 bytes.
+
+    Mask bits are columns handed out to missing blocks as repair frames name them, not
+    block indices: with two million blocks, masks over block indices took 250 KB each.
+    A block named for the first time gets the highest column, so its equation is stored
+    as it is. Once every missing block with a column heads a row, an equation over
+    those blocks alone adds nothing and is dropped without elimination: near the end of
+    a big transfer most repair frames are such, and each would walk thousands of rows.
     """
 
     # Late joiners: while systematic frames still arrive (a grid sender repeats them)
     # and many blocks are missing, repair frames would only add long rows; skip them.
+    # Their elimination also holds up the capture loop, which then misses the repeated
+    # frames: with two million blocks and 5 % missing it took seconds per screen.
     SKIP_MIN_K = 8192
-    SKIP_WINDOW = 1024
+    SKIP_WINDOW = 1024      # repair frames since a new systematic one; at least k/64
+    SKIP_MISSING = 1 << 15  # skip while more than this many, or k/16, are missing
 
     def __init__(self, tid, blob_len, block_size):
         self.tid, self.blob_len, self.block_size = tid, blob_len, block_size
         self.k = -(-blob_len // block_size)
         self.received = 0
         self._known = {}  # block -> value
-        self._rows = {}   # lowest block -> (mask, value) of the other equations
+        self._rows = {}   # highest column -> (mask, value) of the other equations
+        self._column = {}  # block -> its bit in the masks
+        self._blocks = []  # column -> block
+        self._open = 0     # columns whose block is still missing
         self._seen = set()
-        self._since_systematic = self.SKIP_WINDOW  # repair frames since the last new systematic one
+        self._skip_window = max(self.SKIP_WINDOW, self.k >> 6)
+        self._since_systematic = self._skip_window  # repair frames since the last new systematic one
 
     @classmethod
     def for_frame(cls, frame):
@@ -298,32 +312,47 @@ class FountainDecoder:
             self.received += 1
             self._since_systematic = 0
             i = frame.seq
+            if i in known:
+                return False
             known[i] = value
-            row = self._rows.pop(i, None)
+            column = self._column.get(i)
+            if column is None:
+                return True
+            self._open -= 1
+            row = self._rows.pop(column, None)
             if row is None:
                 return True
             # Block i headed an equation over other blocks too: knowing it leaves one
             # about the others.
-            mask, value = row[0] & (row[0] - 1), row[1] ^ value
+            mask, value = row[0] ^ (1 << column), row[1] ^ value
         else:
             self._since_systematic += 1
-            if (self.k >= self.SKIP_MIN_K and self._since_systematic <= self.SKIP_WINDOW
-                    and 8 * (self.k - len(known)) > self.k):
+            if (self.k >= self.SKIP_MIN_K and self._since_systematic <= self._skip_window
+                    and self.k - len(known) > min(self.k >> 4, self.SKIP_MISSING)):
                 return False
             self.received += 1
-            mask = 0
+            mask, fresh = 0, False
+            columns, blocks = self._column, self._blocks
             for i in repair_indices(self.tid, frame.seq, self.k, frame.degree):
                 v = known.get(i)
                 if v is None:
-                    mask |= 1 << i
+                    column = columns.get(i)
+                    if column is None:
+                        column = columns[i] = len(blocks)
+                        blocks.append(i)
+                        self._open += 1
+                        fresh = True
+                    mask |= 1 << column
                 else:
                     value ^= v
-        rows = self._rows
+            if not fresh and len(self._rows) == self._open:
+                return False
+        rows, blocks = self._rows, self._blocks
         while mask:
-            pivot = (mask & -mask).bit_length() - 1
-            v = known.get(pivot)
+            pivot = mask.bit_length() - 1
+            v = known.get(blocks[pivot])
             if v is not None:  # learnt after this row was stored
-                mask &= mask - 1
+                mask ^= 1 << pivot
                 value ^= v
                 continue
             row = rows.get(pivot)
@@ -331,7 +360,8 @@ class FountainDecoder:
                 if mask & (mask - 1):
                     rows[pivot] = (mask, value)
                 else:
-                    known[pivot] = value
+                    known[blocks[pivot]] = value
+                    self._open -= 1
                 return True
             mask ^= row[0]
             value ^= row[1]
@@ -340,22 +370,23 @@ class FountainDecoder:
     def result(self):
         if not self.complete:
             raise ValueError("transfer incomplete")
-        solved = [0] * self.k
-        known, rows = self._known, self._rows
-        for pivot in range(self.k - 1, -1, -1):
-            value = known.get(pivot)
+        known, rows, blocks = self._known, self._rows, self._blocks
+        solved = [0] * len(blocks)  # by column
+        for pivot in range(len(blocks)):
+            value = known.get(blocks[pivot])
             if value is None:
                 mask, value = rows[pivot]
-                # Walk the set bits above the pivot via the mask's binary string.
-                bits = bin(mask >> (pivot + 1))
-                base = len(bits) + pivot  # bits[pos] is block index base - pos
+                # Walk the set bits below the pivot via the mask's binary string.
+                bits = bin(mask ^ (1 << pivot))
+                base = len(bits) - 1  # bits[pos] is column base - pos
                 pos = bits.find("1", 2)
                 while pos != -1:
                     value ^= solved[base - pos]
                     pos = bits.find("1", pos + 1)
             solved[pivot] = value
-        bs = self.block_size
-        return b"".join(v.to_bytes(bs, "little") for v in solved)[:self.blob_len]
+        columns, bs = self._column, self.block_size
+        return b"".join((known[i] if i in known else solved[columns[i]]).to_bytes(bs, "little")
+                        for i in range(self.k))[:self.blob_len]
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +397,12 @@ class FountainDecoder:
 # ---------------------------------------------------------------------------
 
 CONTAINER_MAGIC = b"QXF1"
+# QXF1 uses one SHAKE-256 output as long as the data, but CPython's built-in SHAKE
+# (hashlib's only one on Python 3.6) refuses 2**29 bytes or more. Bigger data uses
+# QXF2: the same layout, with a keystream of 1 MiB pieces numbered after the key.
+CONTAINER_MAGIC_V2 = b"QXF2"
+_V1_MAX_LEN = (1 << 29) - 1
+_STREAM_CHUNK = 1 << 20
 KDF_SCRYPT, KDF_PBKDF2 = 1, 2
 _CONTAINER_HDR = struct.Struct(">4sBBBB16s")  # magic, kdf, param a/b/c, salt
 _TAG_LEN = 32
@@ -391,28 +428,52 @@ def _derive_keys(secret, kdf, a, b, c, salt):
     return key[:32], key[32:]
 
 
-def _keystream_xor(key, data):
-    stream = hashlib.shake_256(b"qrxfer-v1-stream" + key).digest(len(data))
-    return (int.from_bytes(data, "little") ^ int.from_bytes(stream, "little")).to_bytes(len(data), "little")
+def _keystream_xor(magic, key, data):
+    """data XOR the container's keystream, as a list of pieces of up to 1 MiB (whole-data
+    ints would need several copies of a big transfer in memory)."""
+    data, n = memoryview(data), len(data)
+    if magic == CONTAINER_MAGIC:
+        whole = memoryview(hashlib.shake_256(b"qrxfer-v1-stream" + key).digest(n))
+        streams = (whole[i:i + _STREAM_CHUNK] for i in range(0, n, _STREAM_CHUNK))
+    else:
+        streams = (hashlib.shake_256(b"qrxfer-v2-stream" + key + struct.pack(">Q", i // _STREAM_CHUNK))
+                   .digest(min(_STREAM_CHUNK, n - i)) for i in range(0, n, _STREAM_CHUNK))
+    out, pos = [], 0
+    for stream in streams:
+        size = len(stream)
+        out.append((int.from_bytes(data[pos:pos + size], "little") ^ int.from_bytes(stream, "little"))
+                   .to_bytes(size, "little"))
+        pos += size
+    return out
 
 
 def encrypt(plaintext, secret):
     params = (KDF_SCRYPT, 17, 8, 1) if hasattr(hashlib, "scrypt") else (KDF_PBKDF2, 20, 0, 0)
     salt = os.urandom(16)
     enc_key, mac_key = _derive_keys(secret, *(params + (salt,)))
-    body = _CONTAINER_HDR.pack(CONTAINER_MAGIC, *(params + (salt,))) + _keystream_xor(enc_key, plaintext)
-    return body + hmac.new(mac_key, body, hashlib.sha256).digest()
+    # Data that QXF1 can hold stays QXF1, which older receivers can decrypt.
+    magic = CONTAINER_MAGIC if len(plaintext) <= _V1_MAX_LEN else CONTAINER_MAGIC_V2
+    parts = [_CONTAINER_HDR.pack(magic, *(params + (salt,)))] + _keystream_xor(magic, enc_key, plaintext)
+    mac = hmac.new(mac_key, digestmod=hashlib.sha256)
+    for part in parts:
+        mac.update(part)
+    parts.append(mac.digest())
+    return b"".join(parts)
 
 
 def decrypt(blob, secret):
-    if len(blob) < _CONTAINER_HDR.size + _TAG_LEN or blob[:4] != CONTAINER_MAGIC:
+    magic = blob[:4]
+    if len(blob) < _CONTAINER_HDR.size + _TAG_LEN or not magic.startswith(b"QXF"):
         raise QrxferError("this is not qrxfer encrypted data")
+    if magic not in (CONTAINER_MAGIC, CONTAINER_MAGIC_V2):
+        raise QrxferError("unsupported encrypted data format %r (upgrade qrxfer)" % magic.decode("latin-1"))
     _, kdf, a, b, c, salt = _CONTAINER_HDR.unpack_from(blob)
     enc_key, mac_key = _derive_keys(secret, kdf, a, b, c, salt)
-    body, tag = blob[:-_TAG_LEN], blob[-_TAG_LEN:]
+    view = memoryview(blob)
+    body, tag = view[:-_TAG_LEN], bytes(view[-_TAG_LEN:])
     if not hmac.compare_digest(hmac.new(mac_key, body, hashlib.sha256).digest(), tag):
         raise WrongPassphrase("wrong passphrase (or corrupted data)")
-    return _keystream_xor(enc_key, body[_CONTAINER_HDR.size:])
+    return b"".join(_keystream_xor(magic, enc_key, body[_CONTAINER_HDR.size:]))
 
 
 # Generated passphrases: 16 Crockford base32 characters (80 bits) in 4 groups.
@@ -1310,33 +1371,56 @@ def grid_row_digits(raw, cols, y):
 
 class GridStream:
     """Turns fountain frames into grid rows, one frame per row of cells. After the first
-    pass, screens of new repair frames alternate with screens repeating the systematic
-    frames, so a receiver started late gets most blocks on their own (cheap to decode)."""
+    pass, each screen of new repair frames is followed by screens repeating the
+    systematic frames, so a receiver started late gets most blocks on their own (cheap
+    to decode).
+
+    From 65,536 blocks on, three repeat screens follow each repair screen instead of one:
+    a receiver started late then gets the blocks twice as fast, while one that started
+    first finishes as soon. Every screen after the first pass also makes a share of the
+    next repair screen, so all screens take about as long to make and stay up about as
+    long: made at once, the repair frames kept the screen before them up four times as
+    long as the repair screen itself.
+    """
 
     unit = "row"
+    MANY_REPEATS_K = 1 << 16  # blocks from which three repeat screens follow a repair screen
 
     def __init__(self, encoder, cols, rows):
         self.encoder, self.cols, self.rows = encoder, cols, rows
         self.seq = 0  # frames shown
+        self.repeats = 3 if encoder.k >= self.MANY_REPEATS_K else 1
         self._repair, self._repeat, self._after = encoder.k, 0, 0
+        self._ahead = []  # frames of the next repair screen, made in shares
 
     def phase(self):
         k = self.encoder.k
         return "first pass %d%%" % (self.seq * 100 // k) if self.seq < k else "repair + repeats"
 
+    def _repairs(self, count):
+        out = [frame_bytes(self.encoder.frame(seq)) for seq in range(self._repair, self._repair + count)]
+        self._repair += count
+        return out
+
     def take(self, count):
-        k, out = self.encoder.k, []
-        repeat = self.seq >= k and self._after % 2 == 1
-        self._after += self.seq >= k
-        for _ in range(count):
-            if self.seq < k:
-                seq = self.seq
-            elif repeat:
-                seq, self._repeat = self._repeat, (self._repeat + 1) % k
+        k = self.encoder.k
+        if self.seq < k:  # the first pass; its last screen is filled up with repair frames
+            n = min(count, k - self.seq)
+            out = [frame_bytes(self.encoder.frame(seq)) for seq in range(self.seq, self.seq + n)]
+            out += self._repairs(count - n)
+        else:
+            if self._after % (self.repeats + 1):
+                out = []
+                for _ in range(count):
+                    out.append(frame_bytes(self.encoder.frame(self._repeat)))
+                    self._repeat = (self._repeat + 1) % k
             else:
-                seq, self._repair = self._repair, self._repair + 1
-            out.append(frame_bytes(self.encoder.frame(seq)))
-            self.seq += 1
+                out, self._ahead = self._ahead[:count], self._ahead[count:]
+                out += self._repairs(count - len(out))
+            self._after += 1
+            share = min(-(-count // (self.repeats + 1)), count - len(self._ahead))
+            self._ahead += self._repairs(max(0, share))
+        self.seq += count
         return out
 
 
@@ -2239,6 +2323,7 @@ def _send(args, window):
     archive, nfiles, nbytes = pack_paths(args.paths)
     secret, _ = obtain_passphrase(args, "send")
     blob = encrypt(archive, secret)
+    del archive  # a big transfer keeps enough copies in memory as it is
     tid = secrets.randbits(32)
     print("qrxfer %s: %d file%s, %s -> %s compressed and encrypted"
           % (__version__, nfiles, "" if nfiles == 1 else "s", human_size(nbytes), human_size(len(blob))))
@@ -2340,13 +2425,17 @@ def cmd_recv(args):
     secret, interactive = obtain_passphrase(args, "recv")
     outdir = os.path.abspath(args.output)
     print("Watching the %dx%d screen for %s (Ctrl+C aborts). Keep the sender visible and unscaled."
-          % (grabber.width, grabber.height, reader.name))
+          % (grabber.width, grabber.height, reader.name), flush=True)
     started = time.monotonic()
     sess = collect_from_screen(grabber, reader, region, timeout=args.timeout,
                                threads=args.threads or default_decode_threads())
     elapsed = time.monotonic() - started
+    # Solving the stored equations can take minutes for a big transfer.
+    print("All %d blocks arrived after %s; reassembling the data (the sender may be stopped)..."
+          % (sess.k, human_time(elapsed)), flush=True)
     blob = sess.result()
-    print("Received %s in %s from %d frames. Decrypting..." % (human_size(len(blob)), human_time(elapsed), sess.received))
+    print("Received %s in %s from %d frames. Decrypting..." % (human_size(len(blob)), human_time(elapsed), sess.received),
+          flush=True)
     plain = _decrypt_interactively(blob, secret, interactive, outdir)
     _save_received(plain, outdir)
     return 0

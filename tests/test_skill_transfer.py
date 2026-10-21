@@ -12,7 +12,10 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
 import qrxfer
 
@@ -203,6 +206,40 @@ class SkillTransferTest(unittest.TestCase):
         self.assertFalse(remote.exists())
         with self.assertRaisesRegex(ValueError, 'absolute'):
             self.prepare_with_script('bin/qrxfer')
+
+    def test_keepawake_moves_the_pointer_without_keys_until_the_receiver_exits(self):
+        calls = []
+
+        def output(command, **kwargs):
+            calls.append(command)
+            if command[0] == 'xprop':
+                return b'WM_CLASS(STRING) = "vncviewer", "Vncviewer"\n'
+            return 'X=661\nY=1714\nSCREEN=0\nWINDOW=123\n'
+
+        receiver = subprocess.Popen(['sleep', '1.2'])
+        threading.Thread(target=receiver.wait).start()  # reaped, so its PID disappears
+        with mock.patch.object(transfer.subprocess, 'check_output', output), \
+                mock.patch.object(transfer.subprocess, 'check_call', calls.append), \
+                mock.patch.object(transfer.subprocess, 'call', lambda command, **kwargs: calls.append(command)), \
+                mock.patch.object(transfer.shutil, 'which', lambda name: '/usr/bin/' + name), \
+                contextlib.redirect_stdout(io.StringIO()) as log:
+            started = time.monotonic()
+            transfer.keep_awake(argparse.Namespace(window=42, pid=receiver.pid, every=0.4))
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn('has exited', log.getvalue())
+        rounds = [i for i, command in enumerate(calls) if command[0] == 'xscreensaver-command']
+        self.assertGreaterEqual(len(rounds), 2)
+        self.assertEqual(calls[rounds[0]:rounds[1]], [
+            ['xscreensaver-command', '-deactivate'],
+            ['xdotool', 'getmouselocation', '--shell'],
+            ['xdotool', 'mousemove', '--window', '42', '1', '1'],
+            ['xdotool', 'mousemove', '--window', '42', '2', '2'],
+            ['xdotool', 'mousemove', '--screen', '0', '661', '1714']])
+        for command in calls:
+            self.assertFalse({'key', 'type', 'click'} & set(command), command)
+        with self.assertRaisesRegex(ValueError, 'not a VNC viewer'), \
+                mock.patch.object(transfer.subprocess, 'check_output', lambda command: b'"xterm"'):
+            transfer.keep_awake(argparse.Namespace(window=42, pid=os.getpid(), every=0.4))
 
 
 if __name__ == '__main__':

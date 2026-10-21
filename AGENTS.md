@@ -17,10 +17,10 @@ Guidance for coding agents working in this repository. User-facing documentation
 | Path | Purpose |
 |---|---|
 | `qrxfer.py` | The whole program, a single file meant to be copied to both machines |
-| `tests/test_qrxfer.py` | unittest suite (37 tests) |
+| `tests/test_qrxfer.py` | unittest suite (42 tests; `tests/test_skill_transfer.py` covers the skill helper) |
 | `install.sh` | Copies `qrxfer.py` to `~/.local/bin/qrxfer` (or `$QRXFER_BIN_DIR`), then runs `selftest` |
 | `README.md` | User guide |
-| `skills/qrxfer/` | Shared VNC download skill and deterministic bundle/install helper |
+| `skills/qrxfer/` | Shared VNC download skill and deterministic helper (prepare, type, bundle, install, keepawake) |
 
 `qrxfer.py` sections, in file order:
 
@@ -30,11 +30,15 @@ Guidance for coding agents working in this repository. User-facing documentation
    - The receiver does incremental GF(2) Gaussian elimination: `FountainDecoder`, and `rank == k` means complete.
      - Known blocks are kept as values only and substituted into repair frames first; stored rows hold only missing blocks.
        Keeping full masks made a grid transfer of 67k blocks spend ~0.1 s per repair frame and ~k²/16 bytes of memory.
-     - With k ≥ 8192, repair frames are skipped while systematic frames still arrive and more than 1/8 of the blocks are missing (a late joiner of a grid sender, which repeats them).
+     - Mask bits are columns handed out to missing blocks as repair frames name them, not block indices: at k ≈ 2 million (600 MB) masks over block indices grew to ~250 KB per row and many GB in total.
+     - With k ≥ 8192, repair frames are skipped while systematic frames still arrive (a new one within the last max(1024, k/64) repair frames) and more than min(k/16, 32,768) blocks are missing: a late joiner of a grid sender, which repeats them.
+       Eliminating such frames costs seconds per screen at k ≈ 2 million, and the capture loop misses the repeats meanwhile.
 3. **Encryption**: stdlib only.
    - scrypt (`N=2^17, r=8, p=1`), falling back to PBKDF2 2^20 iterations where scrypt is unavailable.
    - SHAKE-256 keystream plus HMAC-SHA256, encrypt-then-MAC.
-   - Container magic `QXF1`.
+   - Container magic `QXF1`: one SHAKE-256 output as long as the data.
+   - `QXF2` for data of 2^29 bytes (512 MiB) or more, which CPython's built-in SHAKE (the only one on Python 3.6) refuses: the same layout, the keystream made of 1 MiB pieces, SHAKE-256 of `b"qrxfer-v2-stream"` + key + 8-byte big-endian piece number.
+     Smaller data stays `QXF1`, so older receivers can still decrypt it.
 4. **Archive**:
    - tar.xz packing.
    - Extraction into a staging dir with the tar `data` filter; files are never overwritten (`name (1).ext`).
@@ -52,7 +56,8 @@ Guidance for coding agents working in this repository. User-facing documentation
    - The status line shows actual/target fps.
 7. **Colour grid sender** (the default codec):
    - `plan_cells`: odd numbers of 3 px cells, a one-cell black/white timing ring and a one-cell black margin.
-   - `GridStream`: one binary frame (`frame_bytes`) per row; after the first pass, screens of repair frames alternate with screens repeating the systematic frames.
+   - `GridStream`: one binary frame (`frame_bytes`) per row; after the first pass, each screen of repair frames is followed by one screen repeating the systematic frames, or three from k ≥ 2^16 (`MANY_REPEATS_K`).
+     Every screen after the first pass makes an equal share of the next repair screen, so all screens take about as long to make and stay up about as long.
    - `GridPainter`: pure-Python BGRX painting (one `join` over pre-rendered cells per line; frames become octal digits through a big-int XOR with the row's whitening).
    - `X11GridWindow` (libX11 through ctypes, prototypes in `_xlib()`): override-redirect full-screen window, `XPutImage` + `XSync`, keyboard grab (keys typed into the VNC viewer), hidden pointer, status line drawn with `XDrawImageString`.
    - `run_x11_grid_sender` installs SIGINT/SIGTERM handlers itself: a background job may start with SIGINT ignored.
@@ -79,9 +84,9 @@ Guidance for coding agents working in this repository. User-facing documentation
   - frame header `>BIIHIH` plus CRC32;
   - Base45 wrapped as `QX:` … `.`;
   - `_SplitMix64` / `repair_indices`;
-  - the `QXF1` container layout and KDF ids;
+  - the `QXF1`/`QXF2` container layouts and keystreams (`_keystream_xor`), the size at which the sender switches to `QXF2`, and the KDF ids;
   - the grid: one `frame_bytes` frame per row of cells, cell colour = 4×red + 2×green + blue from the 8 RGB cube corners, bits most significant first, zero-padded to 3×cols bits and XORed with the first 3×cols bits of bytes y×n … (y+1)×n of `grid_whitening` (SHAKE-256 of `b"qrxfer grid"`, n = ceil(3×cols/8), y = row from the top); the black/white timing ring around the cells; cells of at least 2 px.
-  - Any change needs a `FRAME_VERSION` (or container magic) bump, and must update the golden values in `FrameTest.test_wire_format_is_stable` and `GridFormatTest.test_wire_format_is_stable`.
+  - Any change needs a `FRAME_VERSION` (or container magic) bump, and must update the golden values in `FrameTest.test_wire_format_is_stable`, `GridFormatTest.test_wire_format_is_stable` and `CryptoTest.test_keystream_is_stable`.
 - The repair **degree distribution** (`repair_degree`, `REPAIR_DEGREE_CAP = 256`) is sender-only, because the degree travels in each frame. It may be tuned freely; re-check the overhead with the fountain tests.
 - Also sender-only, since every QR code carries its own version and mask: `FRAME_MASK`, `AUTO_VERSIONS`, the block size and the layout.
   - Before raising `AUTO_VERSIONS` above 17, measure zbar: its decode time per byte rises steeply for bigger codes.
@@ -201,7 +206,7 @@ English is the only language of this repository.
 ## Conventions
 
 - Code style: `%`-formatting and the existing compact style; keep `qrxfer.py` a single file.
-- Project version lives in `__version__` (currently `1.1.0`).
+- Project version lives in `__version__` (currently `1.1.1`).
   - Versions skip any component containing `4` (`1.0.3` → `1.0.5`, `1.3.9` → `1.5.0`).
   - Don't bump for intermediate edits.
 - Documents have no `Revision History` table: git history is the record of revisions.
@@ -227,6 +232,25 @@ This repository is public. Never add anything that identifies a person, a specif
 - One direction only (see above); Wayland-only sessions may not be capturable with `XGetImage`.
 - Region capture costs 10–30 ms and a full-screen grab ~73 ms on this machine; XShm could speed it up if needed.
 - Practical for KB to tens of MB (grid measured up to 20 MB); time grows linearly with size.
+  - A 600 MB transfer crashed a Python 3.6 sender in `encrypt` (fixed by `QXF2`). The decoder for its k ≈ 2 million blocks was simulated offline (2560×1351 grid, 439 rows per screen, first-pass loss 2 % as measured on the real link): done 517 screens after the first pass, 151 s of decoder CPU, 2.3 GB peak. The old decoder passed 8.8 GB and kept slowing down.
+  - The tail is a coupon collector: each repair frame names ~192 of k blocks, so the last missing blocks need ~k/192 × ln(missing) frames; with much higher loss, elimination over tens of thousands of rows makes the decoder the bottleneck (5 % simulated: 577 screens, 930 s of decoder CPU plus 83 s in `result()`, 2.85 GB).
+  - The real link (2026-10-20, 571 MB, k = 2,015,968, Python 3.6 sender at ~6 fps, 1.1.0 code) was much slower than that simulation, which assumed every screen gets read:
+    - A receiver started during the first pass timed out after 90 minutes at 97 %.
+    - One started during the repeat phase reached full rank after 3:16, then spent 13 more silent minutes in `result()` and decryption (12,200 s of CPU, 5.6 GB peak).
+    - Below 7/8 known, the decoder eliminated every repair frame, which cost seconds per captured repair screen on the capture loop's thread. Meanwhile the receiver missed the repeat screens that carry the missing blocks.
+    - While repair frames were still skipped it took in ~1,460 blocks/s (every repeat screen); afterwards 6–40 blocks/s, with 11–80 s between progress lines.
+    - One cycle of repeat screens took ~23 minutes, and each repeat screen stayed up four times as long as a repair screen, because the next repair screen was made while it was shown.
+  - Since then: repair frames wait until at most min(k/16, 32,768) blocks are missing, three repeat screens follow each repair screen from k ≥ 2^16, and every screen makes a share of the next repair screen.
+    - A time-driven model checked these changes: sender screens take 61.5 ms plus 0.41 ms per repair frame made (the real remote), and the receiver reads a screen only if its capture loop is free while the screen is up, the real `FountainDecoder`'s CPU time keeping the loop busy.
+      With the 1.1.0 code the model tracked the real late receiver within a few percent up to 30 minutes (94 %).
+    - With the current code, at k = 2,015,968: late receiver 12.5 min (41 s decoder CPU, 2.4 s `result()`); receiver started first with 7 % of first-pass screens lost: 14.7 min, while 1.1.0 was at 97.8 % after 30 min.
+    - Receiver started first, 2 % lost, two seeds run side by side on idle cores: 8.5 and 11.6 min, against 8.0 and 11.3 min for 1.1.0 (decoder CPU 71–75 s against 158–338 s); one repeat screen instead of three: 8.7 and 14.7 min.
+    - Runs vary by minutes with where the screens were lost and with CPU contention, since the decoder's measured CPU time feeds back into what the receiver misses: compare only runs made side by side, each on its own physical core.
+    - When 30 % of all screens are lost, the late receiver takes 40 min: each round of repeat screens fills only 70 % of the gaps.
+  - Through a local TigerVNC hop (Python 3.6 sender in Docker, 20 MB = 67,346 blocks, single runs), receiver started 45 s after the sender: 1.1.0 83 s; one repeat screen per repair screen 40–44 s; three 20 s.
+    Receiver started first: 27 s with one or three. The time-driven model agrees (late: 25–31 s against 52–64 s; first: equal), hence three repeat screens from 2^16 blocks.
 - The grid needs a 24-bit X display on the sender; it covers the whole screen, so the remote desktop is unusable while sending.
 - Terminal mode is bounded by the terminal's redraw rate, not by qrxfer.
+- Screensavers on either side hide the grid. Both idle timers start at the last keystroke typed through the viewer, so both fire in the middle of a long transfer (seen after 30 min on both sides, receiver stalled until woken). Keep both awake: pointer motion over the viewer wakes the remote without sending the sender a key; the skill's `keepawake` helper does that every 4 minutes.
+- Elimination still runs on the capture loop's thread. A decoder thread with a bounded queue of repair frames would keep the capture going while it works, at the price of GIL contention.
 - The grid sender's repair phase is CPU-bound in Python (`repair_indices`); a lower repair degree for large k could help, re-check the overhead with the fountain tests.

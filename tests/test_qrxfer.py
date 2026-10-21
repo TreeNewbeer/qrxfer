@@ -1,5 +1,6 @@
 """Unit and pipeline tests for qrxfer (python3 -m unittest discover -s tests)."""
 
+import hashlib
 import importlib.util
 import io
 import os
@@ -82,6 +83,38 @@ class GridFormatTest(unittest.TestCase):
         self.assertEqual(raw[:21].hex(), "0100c0ffee000000c8006400000001000164656667")
         self.assertEqual(q.b45decode(q.pack_frame(frame)[3:-1]), raw)  # QR codes carry the same bytes
         self.assertEqual(q.parse_frame_bytes(raw).payload, frame.payload)
+
+    def test_stream_order_and_shares_of_repair_work(self):
+        # After the first pass, each repair screen is followed by one repeat screen (three
+        # for big transfers), and every screen makes the same share of the next repair one.
+        for big in (False, True):
+            enc = q.FountainEncoder(os.urandom(1000 * 8 - 3), 8, 5)
+            stream = q.GridStream(enc, 99, 30)
+            if big:
+                stream.repeats = 3
+            self.assertEqual(stream.repeats, 3 if big else 1)
+            screens, made = [], []
+            while len(screens) < 34 + 4 * (stream.repeats + 1):
+                before = stream._repair
+                screens.append([q.parse_frame_bytes(raw).seq for raw in stream.take(30)])
+                made.append(stream._repair - before)
+            self.assertEqual(sum(screens[:34], []), list(range(1000)) + list(range(1000, 1020)))
+            after, repair, repeat = screens[34:], 1020, 0
+            for i, seqs in enumerate(after):
+                if i % (stream.repeats + 1):
+                    self.assertEqual(seqs, [(repeat + j) % 1000 for j in range(30)])
+                    repeat += 30
+                else:
+                    self.assertEqual(seqs, list(range(repair, repair + 30)))
+                    repair += 30
+            self.assertEqual(made[:34], [0] * 33 + [20])
+            cycle = stream.repeats + 1
+            made[34] -= 30  # nothing was made ahead of the first repair screen
+            share = -(-30 // cycle)
+            self.assertTrue(all(30 - (cycle - 1) * share <= m <= share for m in made[34:]), made)
+            self.assertEqual({sum(made[i:i + cycle]) for i in range(34, len(made) - cycle + 1, cycle)}, {30})
+        for k, repeats in ((q.GridStream.MANY_REPEATS_K - 1, 1), (q.GridStream.MANY_REPEATS_K, 3)):
+            self.assertEqual(q.GridStream(q.FountainEncoder(bytes(k), 1, 5), 99, 30).repeats, repeats)
 
     def test_painter_colours_and_ring(self):
         painter = q.GridPainter(3, 1, 2, lambda r, g, b: bytes((r, g, b, 0)))
@@ -270,6 +303,40 @@ class FountainTest(unittest.TestCase):
             if not late:
                 self.assertLess(shown, 1.2 * enc.k)
 
+    def test_rank_matches_plain_elimination(self):
+        # Substituting known blocks, columns and dropping equations over determined blocks
+        # must keep `rank` exact: compare with plain elimination over block bitmasks, for a
+        # first pass with losses, then repair frames mixed with repeated systematic ones.
+        for seed in range(4):
+            rnd = random.Random(seed)
+            blob = os.urandom(6000 * 4 - 3)
+            enc = q.FountainEncoder(blob, 4, seed)
+            dec = q.FountainDecoder.for_frame(enc.frame(0))
+            pivots = {}
+            seqs = [s for s in range(enc.k) if rnd.random() > 0.02]
+            repair = enc.k
+            while not dec.complete:
+                if seqs:
+                    seq = seqs.pop(0)
+                elif rnd.random() < 0.3:
+                    seq = rnd.randrange(enc.k)
+                else:
+                    seq, repair = repair, repair + 1
+                frame = enc.frame(seq)
+                mask = 1 << seq if seq < enc.k else sum(
+                    1 << i for i in q.repair_indices(frame.tid, seq, enc.k, frame.degree))
+                while mask and mask.bit_length() - 1 in pivots:
+                    mask ^= pivots[mask.bit_length() - 1]
+                if mask:
+                    pivots[mask.bit_length() - 1] = mask
+                rank = dec.rank
+                self.assertEqual(dec.add(frame), len(pivots) > rank)
+                self.assertEqual(dec.rank, len(pivots))
+                missing = [c for c, b in enumerate(dec._blocks) if b not in dec._known]
+                self.assertEqual(dec._open, len(missing))
+                self.assertLess(repair, 2 * enc.k)
+            self.assertEqual(dec.result(), blob)
+
     def test_repair_only_after_heavy_loss(self):
         # Skipping heavy repair frames must stop when no systematic frames follow (QR codes).
         enc = q.FountainEncoder(os.urandom(300 * 20), 20, 3)
@@ -284,6 +351,35 @@ class FountainTest(unittest.TestCase):
             self.assertLess(seq, enc.k + q.FountainDecoder.SKIP_WINDOW + 4 * enc.k)
         self.assertEqual(dec.received, enc.k // 2 + seq - enc.k - q.FountainDecoder.SKIP_WINDOW)
 
+    def test_repair_skipped_while_repeats_bring_many_missing_blocks(self):
+        # Repair frames wait until at most min(k/16, SKIP_MISSING) blocks are missing, as
+        # long as new systematic frames keep coming within max(1024, k/64) repair frames.
+        blob = os.urandom(20000 * 4 - 1)
+        enc = q.FountainEncoder(blob, 4, 9)
+        dec = q.FountainDecoder.for_frame(enc.frame(0))
+        dec.SKIP_MISSING = 600
+        self.assertEqual(dec._skip_window, q.FountainDecoder.SKIP_WINDOW)
+        self.assertEqual(q.FountainDecoder(0, 1 << 17, 1)._skip_window, 2048)
+        missing = list(range(0, enc.k, 10))  # 2000 blocks; k/16 is 1250
+        for seq in range(enc.k):
+            if seq % 10:
+                dec.add(enc.frame(seq))
+        repair = enc.k
+        while len(missing) > 600:
+            for _ in range(500):
+                self.assertFalse(dec.add(enc.frame(repair)))
+                repair += 1
+            for _ in range(100):
+                dec.add(enc.frame(missing.pop()))
+        self.assertEqual((dec.rank, dec.received), (enc.k - 600, enc.k - 600))
+        self.assertEqual(repair, enc.k + 14 * 500)
+        self.assertTrue(dec.add(enc.frame(repair)))  # 600 missing: no longer skipped
+        while not dec.complete:
+            repair += 1
+            dec.add(enc.frame(repair))
+        self.assertEqual(dec.result(), blob)
+        self.assertLess(repair - enc.k - 14 * 500, 800)  # 668
+
     def test_other_transfer_rejected(self):
         a = q.FountainEncoder(b"a" * 100, 10, 1)
         b = q.FountainEncoder(b"b" * 100, 10, 2)
@@ -296,6 +392,7 @@ class CryptoTest(unittest.TestCase):
     def test_roundtrip_wrong_pass_and_tamper(self):
         data = os.urandom(5000)
         blob = q.encrypt(data, "secret")
+        self.assertEqual(blob[:4], b"QXF1")
         self.assertEqual(q.decrypt(blob, "secret"), data)
         self.assertNotIn(data[:64], blob)
         with self.assertRaises(q.WrongPassphrase):
@@ -306,6 +403,38 @@ class CryptoTest(unittest.TestCase):
             with self.assertRaises(q.QrxferError):
                 q.decrypt(bytes(tampered), "secret")
         self.assertNotEqual(q.encrypt(data, "secret"), blob)  # fresh salt every time
+
+    def test_keystream_is_stable(self):
+        # Wire format: both machines must derive the same keystream.
+        key = bytes(range(32))
+        n = 2 * q._STREAM_CHUNK + 12345
+        data = bytes(range(256)) * (n // 256) + bytes(n % 256)
+        for magic, digest in ((b"QXF1", "8c5bc1923f992a71b3e8f6ef6ffa5b992e2f19a2b89a328207e94bd302aca5a5"),
+                              (b"QXF2", "92c008b674b2ff07afe970fd1ab646354d2a0e82916355ba3d69986e7997b45a")):
+            pieces = q._keystream_xor(magic, key, data)
+            self.assertEqual([len(p) for p in pieces], [q._STREAM_CHUNK] * 2 + [12345])
+            self.assertEqual(hashlib.sha256(b"".join(pieces)).hexdigest(), digest)
+
+    def test_large_data_uses_chunked_container(self):
+        # Python 3.6's SHAKE cannot make a QXF1 keystream of 512 MiB or more; pretend
+        # the limit is lower instead of encrypting that much.
+        data = os.urandom(2 * q._STREAM_CHUNK + 777)
+        old, q._V1_MAX_LEN = q._V1_MAX_LEN, len(data) - 1
+        try:
+            blob = q.encrypt(data, "secret")
+        finally:
+            q._V1_MAX_LEN = old
+        self.assertEqual(blob[:4], b"QXF2")
+        self.assertEqual(len(blob), len(data) + q._CONTAINER_HDR.size + q._TAG_LEN)
+        self.assertEqual(q.decrypt(blob, "secret"), data)
+        with self.assertRaises(q.WrongPassphrase):
+            q.decrypt(blob, "Secret")
+        tampered = bytearray(blob)
+        tampered[-100] ^= 1
+        with self.assertRaises(q.WrongPassphrase):
+            q.decrypt(bytes(tampered), "secret")
+        with self.assertRaisesRegex(q.QrxferError, "upgrade qrxfer"):
+            q.decrypt(b"QXF9" + blob[4:], "secret")
 
     def test_pbkdf2_fallback_and_bounds(self):
         salt = os.urandom(16)

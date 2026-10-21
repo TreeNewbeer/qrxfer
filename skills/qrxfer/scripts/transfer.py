@@ -16,6 +16,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import uuid
 import zlib
 
@@ -114,10 +115,14 @@ print('QRXFER_READY '+d)
     print(json.dumps(context, indent=2))
 
 
-def type_file(args):
-    identity = subprocess.check_output(['xprop', '-id', str(args.window), 'WM_CLASS'])
+def check_viewer(window):
+    identity = subprocess.check_output(['xprop', '-id', str(window), 'WM_CLASS'])
     if b'vnc' not in identity.lower():
         raise ValueError('The target window is not a VNC viewer')
+
+
+def type_file(args):
+    check_viewer(args.window)
     with open(args.file, 'rb') as source:
         content = source.read()
     if b'\n' in content or b'\r' in content:
@@ -132,6 +137,38 @@ def type_file(args):
         subprocess.check_call(['xdotool', 'key', '--window', str(args.window),
                                '--clearmodifiers', 'Return'])
     print('Keys sent to VNC window %s; check the remote screen.' % args.window)
+
+
+def running(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def keep_awake(args):
+    # Screensavers on both sides start counting at the last key typed through the
+    # viewer and cover the grid half an hour into a long transfer. xscreensaver ignores
+    # pointer warps, so it is told directly; the viewer forwards pointer motion, which
+    # keeps the remote awake. No keys: the grid sender stops on q.
+    check_viewer(args.window)
+    while running(args.pid):
+        if shutil.which('xscreensaver-command'):
+            subprocess.call(['xscreensaver-command', '-deactivate'],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        where = dict(line.split('=', 1) for line in subprocess.check_output(
+            ['xdotool', 'getmouselocation', '--shell'], universal_newlines=True).split())
+        for x, y in ((1, 1), (2, 2)):  # the remote screen's corner, in the grid's black margin
+            subprocess.check_call(['xdotool', 'mousemove', '--window', str(args.window), str(x), str(y)])
+        subprocess.check_call(['xdotool', 'mousemove', '--screen', where['SCREEN'], where['X'], where['Y']])
+        print('%s nudged VNC window %s' % (time.strftime('%H:%M:%S'), args.window), flush=True)
+        deadline = time.monotonic() + args.every
+        while running(args.pid) and time.monotonic() < deadline:
+            time.sleep(min(1.0, args.every))
+    print('Process %d has exited; stopped.' % args.pid)
 
 
 def paths_in(root):
@@ -347,6 +384,11 @@ def main():
     p.add_argument('--file', required=True)
     p.add_argument('--enter', action='store_true')
     p.set_defaults(run=type_file)
+    p = commands.add_parser('keepawake', help='keep both screensavers off until a process exits')
+    p.add_argument('--window', type=int, required=True)
+    p.add_argument('--pid', type=int, required=True, help='the local receiver')
+    p.add_argument('--every', type=float, default=240.0, help='seconds between nudges')
+    p.set_defaults(run=keep_awake)
     p = commands.add_parser('bundle', help='run on the sender; pack source and hash manifest')
     p.add_argument('--source', required=True)
     p.add_argument('--output', required=True)

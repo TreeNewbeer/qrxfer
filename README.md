@@ -60,7 +60,9 @@ QRXFER_BIN_DIR=/opt/bin ./install.sh  # install to another directory
 
 3. When the local progress bar reaches 100 %, the receiver decrypts, unpacks and lists the saved files. Then press `q` in the VNC window to close the grid: it holds the keyboard while it is shown, so keys typed into the VNC viewer reach it.
 
-Either side may start first. After the first pass over the data, the sender alternates screens of repair frames with screens that repeat the original frames, so a receiver started late still catches up quickly.
+Either side may start first. After the first pass over the data, each screen of repair frames is followed by a screen that repeats original frames, so a receiver started late still catches up quickly. Transfers of 65,536 frames or more (about 19 MB on a 2560-pixel-wide screen) show three repeat screens per repair screen, so the repeats go round all the data faster.
+
+For long transfers, keep the screensavers on both sides from starting: they cover the grid, and both count idle time from the last key typed through the VNC viewer. Moving the mouse over the VNC window keeps the remote awake without sending the sender a key.
 
 ### Sender keys
 
@@ -163,7 +165,7 @@ Text files are compressed with xz first, so the effective file throughput is hig
 
 ## Security
 
-- **Encryption**: scrypt (N=2¹⁷, r=8, p=1, about 128 MiB of memory; PBKDF2-SHA256 with 2²⁰ iterations on old OpenSSL builds without scrypt) derives a 64-byte key from the passphrase and a 16-byte random salt. Half of it keys a SHAKE-256 keystream for encryption, the other half keys HMAC-SHA256 for authentication (encrypt-then-MAC). Every transfer gets a new salt and new keys. Everything uses the Python standard library (hashlib/hmac, backed by OpenSSL or CPython's built-in implementations), so the remote machine needs no crypto library.
+- **Encryption**: scrypt (N=2¹⁷, r=8, p=1, about 128 MiB of memory; PBKDF2-SHA256 with 2²⁰ iterations on old OpenSSL builds without scrypt) derives a 64-byte key from the passphrase and a 16-byte random salt. Half of it keys a SHAKE-256 keystream for encryption, the other half keys HMAC-SHA256 for authentication (encrypt-then-MAC). Every transfer gets a new salt and new keys. Archives of 512 MiB or more, which CPython's built-in SHAKE-256 (the only one on Python 3.6) cannot cover in one output, use a keystream made of 1 MiB pieces; receivers older than this change cannot decrypt those. Everything uses the Python standard library (hashlib/hmac, backed by OpenSSL or CPython's built-in implementations), so the remote machine needs no crypto library.
 - **Integrity**: every frame carries a CRC32 and the whole payload an HMAC; a wrong passphrase or tampered data is rejected and nothing is written.
 - **What it protects against**: if the screen is photographed, recorded or seen by someone else, the file contents cannot be recovered without the passphrase.
 - **What to watch out for**: the passphrase is typed on the remote machine (through the VNC keyboard). **If the VNC connection itself is not encrypted** (no TLS or SSH tunnel), an eavesdropper on the network sees both the screen and the keystrokes, and the encryption is pointless. In that case:
@@ -175,7 +177,7 @@ Text files are compressed with xz first, so the effective file throughput is hig
 
 - The screen channel is one-way: files can only go from **the side that shows the screen (VNC server / remote)** to **the side that watches it (local)**. Local → remote is not possible this way.
 - Screen capture on the receiver needs X11 (XFCE, MATE and other X11 sessions all work); in a pure Wayland session the window contents may not be capturable. The grid window on the sender likewise needs an X11 display with 24-bit colour; otherwise use QR codes (`--terminal`).
-- Suited to files from KB to tens of MB (measured up to 20 MB with the grid); time grows linearly with size (see the tables above).
+- Suited to files from KB to tens of MB (measured up to 20 MB with the grid); time grows linearly with size (see the tables above). Hundreds of MB take tens of minutes: a Python 3.6 sender spends minutes compressing them, and a 2560×1351 screen of 3-pixel cells carries about 127 KB, so 600 MB needs some 4,700 screens. A 571 MB transfer over a real VNC link took 3.5 hours with version 1.1.0, whose receiver fell behind while solving repair frames. Simulated with that link's timing, the current version takes about 8–15 minutes, whether the receiver starts first or joins late.
 
 ## Development and testing
 
