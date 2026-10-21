@@ -392,7 +392,8 @@ class CryptoTest(unittest.TestCase):
     def test_roundtrip_wrong_pass_and_tamper(self):
         data = os.urandom(5000)
         blob = q.encrypt(data, "secret")
-        self.assertEqual(blob[:4], b"QXF1")
+        self.assertEqual(blob[:4], b"QXF2")
+        self.assertEqual(len(blob), len(data) + q._CONTAINER_HDR.size + q._TAG_LEN)
         self.assertEqual(q.decrypt(blob, "secret"), data)
         self.assertNotIn(data[:64], blob)
         with self.assertRaises(q.WrongPassphrase):
@@ -409,22 +410,15 @@ class CryptoTest(unittest.TestCase):
         key = bytes(range(32))
         n = 2 * q._STREAM_CHUNK + 12345
         data = bytes(range(256)) * (n // 256) + bytes(n % 256)
-        for magic, digest in ((b"QXF1", "8c5bc1923f992a71b3e8f6ef6ffa5b992e2f19a2b89a328207e94bd302aca5a5"),
-                              (b"QXF2", "92c008b674b2ff07afe970fd1ab646354d2a0e82916355ba3d69986e7997b45a")):
-            pieces = q._keystream_xor(magic, key, data)
-            self.assertEqual([len(p) for p in pieces], [q._STREAM_CHUNK] * 2 + [12345])
-            self.assertEqual(hashlib.sha256(b"".join(pieces)).hexdigest(), digest)
+        pieces = q._keystream_xor(key, data)
+        self.assertEqual([len(p) for p in pieces], [q._STREAM_CHUNK] * 2 + [12345])
+        self.assertEqual(hashlib.sha256(b"".join(pieces)).hexdigest(),
+                         "92c008b674b2ff07afe970fd1ab646354d2a0e82916355ba3d69986e7997b45a")
 
-    def test_large_data_uses_chunked_container(self):
-        # Python 3.6's SHAKE cannot make a QXF1 keystream of 512 MiB or more; pretend
-        # the limit is lower instead of encrypting that much.
+    def test_data_of_several_keystream_pieces(self):
+        # Python 3.6's SHAKE cannot make 512 MiB at once, hence the pieces.
         data = os.urandom(2 * q._STREAM_CHUNK + 777)
-        old, q._V1_MAX_LEN = q._V1_MAX_LEN, len(data) - 1
-        try:
-            blob = q.encrypt(data, "secret")
-        finally:
-            q._V1_MAX_LEN = old
-        self.assertEqual(blob[:4], b"QXF2")
+        blob = q.encrypt(data, "secret")
         self.assertEqual(len(blob), len(data) + q._CONTAINER_HDR.size + q._TAG_LEN)
         self.assertEqual(q.decrypt(blob, "secret"), data)
         with self.assertRaises(q.WrongPassphrase):
@@ -433,8 +427,9 @@ class CryptoTest(unittest.TestCase):
         tampered[-100] ^= 1
         with self.assertRaises(q.WrongPassphrase):
             q.decrypt(bytes(tampered), "secret")
-        with self.assertRaisesRegex(q.QrxferError, "upgrade qrxfer"):
-            q.decrypt(b"QXF9" + blob[4:], "secret")
+        for magic in (b"QXF1", b"QXF9"):  # QXF1 was the single-stream format of 1.1.1 and older
+            with self.assertRaisesRegex(q.QrxferError, "same qrxfer version"):
+                q.decrypt(magic + blob[4:], "secret")
 
     def test_pbkdf2_fallback_and_bounds(self):
         salt = os.urandom(16)

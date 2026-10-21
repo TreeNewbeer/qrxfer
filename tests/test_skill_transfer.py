@@ -184,7 +184,7 @@ class SkillTransferTest(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(context['script'], str(installed))
         self.assertEqual(context['qrxfer_sha256'], transfer.file_hash(str(PROJECT / 'qrxfer.py')))
-        self.assertIn('QRXFER_SCRIPT version=%s grid=yes sha256=%s\n' % (
+        self.assertIn('QRXFER_SCRIPT version=%s sha256=%s\n' % (
             qrxfer.__version__, context['qrxfer_sha256']), run.stdout)
         self.assertTrue(run.stdout.endswith('QRXFER_READY %s\n' % remote))
         self.assertEqual(sorted(os.listdir(str(remote))), ['transfer.py'])  # only the helper is typed in
@@ -193,12 +193,11 @@ class SkillTransferTest(unittest.TestCase):
             self.assertEqual(command[:3], ['python3', str(installed), 'send'])
         self.assertEqual(installed.read_bytes(), (PROJECT / 'qrxfer.py').read_bytes())
 
-        # A version from before the grid: reported, and send_qr.txt needs no --codec.
-        installed.write_text('__version__ = "1.0.0"\nprint("qr only")\n')
+        # Another version is reported with its own digest, so the agent can tell it apart.
+        installed.write_text('__version__ = "1.0.0"\nprint("old")\n')
         context, local, remote, run = self.prepare_with_script(str(installed))
-        self.assertIn('QRXFER_SCRIPT version=1.0.0 grid=no sha256=', run.stdout)
-        self.assertNotIn('--codec', (local / 'send_qr.txt').read_text())
-        self.assertTrue((local / 'send_qr.txt').read_text().endswith(' --fps 20 --terminal'))
+        self.assertIn('QRXFER_SCRIPT version=1.0.0 sha256=%s\n' % transfer.file_hash(str(installed)), run.stdout)
+        self.assertNotEqual(transfer.file_hash(str(installed)), context['qrxfer_sha256'])
 
         context, local, remote, run = self.prepare_with_script(str(self.root / 'missing'))
         self.assertNotEqual(run.returncode, 0)
@@ -240,6 +239,25 @@ class SkillTransferTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'not a VNC viewer'), \
                 mock.patch.object(transfer.subprocess, 'check_output', lambda command: b'"xterm"'):
             transfer.keep_awake(argparse.Namespace(window=42, pid=os.getpid(), every=0.4))
+
+    def test_type_releases_return_when_the_window_closes_on_it(self):
+        line = self.root / 'line.txt'
+        line.write_text('secret')
+        calls = []
+
+        def check_call(command):
+            calls.append(command)
+            if 'Return' in command:  # the dialog closed on the key press: BadWindow
+                raise subprocess.CalledProcessError(1, command)
+
+        with mock.patch.object(transfer.subprocess, 'check_output', lambda command: b'"TigerVNC Viewer"'), \
+                mock.patch.object(transfer.subprocess, 'check_call', check_call), \
+                mock.patch.object(transfer.subprocess, 'call', calls.append), \
+                self.assertRaises(subprocess.CalledProcessError):
+            transfer.type_file(argparse.Namespace(window=42, file=str(line), enter=True))
+        self.assertEqual([command[:2] for command in calls], [
+            ['xdotool', 'windowfocus'], ['xdotool', 'type'], ['xdotool', 'key'], ['xdotool', 'keyup']])
+        self.assertEqual(calls[-1], ['xdotool', 'keyup', 'Return'])
 
 
 if __name__ == '__main__':

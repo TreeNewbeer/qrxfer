@@ -74,8 +74,7 @@ if s:
     with open(s,'rb') as f:
         q=f.read()
     v=re.search(br'^__version__ = "([^"]+)"',q,re.M)
-    print('QRXFER_SCRIPT version=%%s grid=%%s sha256=%%s'%%(v.group(1).decode('ascii') if v else '?',
-          'yes' if b'--codec' in q else 'no',hashlib.sha256(q).hexdigest()))
+    print('QRXFER_SCRIPT version=%%s sha256=%%s'%%(v.group(1).decode('ascii') if v else '?',hashlib.sha256(q).hexdigest()))
 p=json.loads(zlib.decompress(base64.b64decode(%r)).decode('ascii'))
 os.mkdir(d,0o700)
 for name,(encoded,digest) in p.items():
@@ -94,7 +93,6 @@ print('QRXFER_READY '+d)
         shlex.quote(args.script or remote + '/qrxfer.py'), shlex.quote(remote + '/payload.tar.xz'),
         shlex.quote(remote + '/manifest.json'))
     # Fallback when the colour grid cannot be shown or read: QR codes in the terminal.
-    # Plain --terminal also works with qrxfer versions that predate the grid.
     send_qr = send + ' --terminal'
     cleanup = python_command("import os,shutil;p=%r;assert os.path.isdir(p) "
                              "and not os.path.islink(p);shutil.rmtree(p);"
@@ -134,8 +132,13 @@ def type_file(args):
     subprocess.check_call(['xdotool', 'type', '--window', str(args.window),
                            '--clearmodifiers', '--delay', '1', '--file', args.file])
     if args.enter:
-        subprocess.check_call(['xdotool', 'key', '--window', str(args.window),
-                               '--clearmodifiers', 'Return'])
+        try:
+            subprocess.check_call(['xdotool', 'key', '--window', str(args.window),
+                                   '--clearmodifiers', 'Return'])
+        finally:
+            # A window that closes on Return (the viewer's password dialog) makes xdotool
+            # fail between press and release; a held Return then repeats into the remote.
+            subprocess.call(['xdotool', 'keyup', 'Return'])
     print('Keys sent to VNC window %s; check the remote screen.' % args.window)
 
 

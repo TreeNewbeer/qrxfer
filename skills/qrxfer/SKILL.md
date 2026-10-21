@@ -2,7 +2,7 @@
 name: qrxfer
 description: Download files or folders from a remote Linux VNC desktop using qrxfer's animated colour grid (QR codes as a fallback). Use for /qrxfer server password source-path dest-path (or labelled: script:remote-qrxfer source:path dest:path), or an explicit request to copy from a VNC server through qrxfer.
 metadata:
-  version: "1.1.1"
+  version: "1.2.0"
 ---
 
 # qrxfer
@@ -19,7 +19,7 @@ Download a file or folder from a remote Linux machine to this machine through an
 - Split the arguments by shell quoting rules, but never hand the argument string to a shell for execution; paths or passwords containing spaces are quoted.
 - The first two arguments are always server and password, taken as they are, even when they contain a colon or look like a label.
 - After them, an argument starting with `script:`, `source:` or `dest:` names that value. The value follows the colon directly, or is the next argument when nothing follows the colon, so `dest: /path` equals `dest:/path`. Arguments without a label fill source and then dest; script is only accepted with its label. A repeated label, a missing source or dest, or an extra argument is missing information: ask instead of guessing.
-- script is optional: the absolute path of a qrxfer copy already on the remote machine (`qrxfer.py`, or a copy installed as `qrxfer`). With it, only the small helper is typed in through VNC instead of qrxfer as well (about 12 instead of 79 thousand characters), and the remote copy is read and run, never changed or deleted. Without it, this project's qrxfer is installed in the run's temporary remote directory.
+- script is optional: the absolute path of a qrxfer copy already on the remote machine (`qrxfer.py`, or a copy installed as `qrxfer`), identical to this project's qrxfer. With it, only the small helper is typed in through VNC instead of qrxfer as well (about 12 instead of 79 thousand characters), and the remote copy is read and run, never changed or deleted. Without it, this project's qrxfer is installed in the run's temporary remote directory.
 - server is the VNC address: host defaults to port 5900; host:69 is display 69, port 5969; host::5969 is an explicit port. IPv4 addresses and host names are supported. The password is used only for VNC authentication; the qrxfer transfer uses a separate passphrase generated at random for this run.
 - source path is an absolute path on the remote machine; dest path is the local parent directory that receives it. For example, downloading the source directory project to ~/Downloads gives ~/Downloads/project. When an item with the same name exists, the download is saved as a new item with a numeric suffix and the existing item stays intact.
 - Copy only the given source; symlinks keep their link text and are not followed to outside directories. The original files, remote repositories and system configuration are not changed by the transfer.
@@ -49,9 +49,9 @@ python3 SKILL_DIR/scripts/transfer.py type --window WINDOW_ID --file INPUT_FILE 
 ```
 
 1. Once the remote shell is confirmed, turn terminal echo off for the moment and send bootstrap.txt from work. It compresses the helper, and the current project's qrxfer unless script was given, places them in the unique remote_work through the VNC keyboard and checks their SHA-256. Confirm that the screen shows QRXFER_READY with this run's path, then turn echo back on. The clipboard may be tried first for short commands; if the result is not seen on screen, use the targeted keyboard input above, and never treat a successful paste as fact.
-   - With script, the bootstrap first reads that file without running it and prints `QRXFER_SCRIPT version=… grid=yes|no sha256=…`; a wrong path stops it with an error before it creates remote_work.
-   - The same sha256 as qrxfer_sha256 means the same qrxfer as this project. Otherwise go by grid: yes → send.txt; no means a qrxfer from before the colour grid → send_qr.txt (QR codes in the terminal, see step 4).
-   - If the script is missing, unreadable or not qrxfer (version ?), tell the user and continue with a fresh prepare without --script, which installs this project's qrxfer. If the abandoned run's bootstrap printed QRXFER_READY, send that run's cleanup.txt first; from then on use only the new run's paths.
+   - With script, the bootstrap first reads that file without running it and prints `QRXFER_SCRIPT version=… sha256=…`; a wrong path stops it with an error before it creates remote_work.
+   - Use the script only when its sha256 equals qrxfer_sha256: other qrxfer versions are not compatible with this receiver.
+   - If the sha256 differs, or the script is missing, unreadable or not qrxfer (version ?), tell the user (with both versions) and continue with a fresh prepare without --script, which installs this project's qrxfer. If the abandoned run's bootstrap printed QRXFER_READY, send that run's cleanup.txt first; from then on use only the new run's paths.
 2. Send bundle.txt, wait for the command to exit, and check the file count, total bytes, compressed size, manifest_sha256 and the symlink summary. Keep the manifest_sha256 from the screenshot to check against the manifest once received. Permission errors, a source that changes while being read, or special files are real failures; after fixing the cause, bundle again into a fresh remote temporary directory, and never skip files and then claim a complete success.
 3. bundle packs the source into payload.tar.xz and writes manifest.json. qrxfer then sends these two regular files; this is how external symlinks are preserved. The receiver still uses qrxfer's own safe extraction, without loosening its tar filter.
 4. send.txt shows the colour grid: a full-screen window of 3 px cells in 8 colours, with a status line at the bottom.

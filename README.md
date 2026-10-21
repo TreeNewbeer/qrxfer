@@ -26,7 +26,7 @@
 
 ## Installation
 
-Copy `qrxfer.py` to both machines (it is a single file). Alternatively, run the install script, which copies it to `~/.local/bin/qrxfer` and runs the self-test:
+Copy `qrxfer.py` to both machines (it is a single file); both must run the same version, since nothing is kept for compatibility with older copies. Alternatively, run the install script, which copies it to `~/.local/bin/qrxfer` and runs the self-test:
 
 ```sh
 ./install.sh                          # install to ~/.local/bin/qrxfer
@@ -84,7 +84,7 @@ The repository ships an agent skill whose text lives in `skills/qrxfer/SKILL.md`
 
 Quote arguments that contain spaces. In the second form the labelled values may come in any order, and a label may be followed by a space (`dest: ~/Downloads`); server and password always come first, unlabelled. A single colon in the server is a VNC display number, e.g. `192.0.2.10:69` means port 5969; write an explicit port as `192.0.2.10::5969`. The source is an absolute path on the remote machine and the destination is the local parent directory: a source directory `project` is saved as `project` under dest, and an existing item with the same name makes the download land under a new name with a numeric suffix. The password is the VNC login password; the transfer itself uses a separately generated random passphrase, and the skill stores no credentials.
 
-Without `script:`, the skill types this repository's `qrxfer.py` into a temporary directory on the remote through the VNC keyboard (about 79 thousand characters). If qrxfer is already on the remote machine, pass its absolute path as `script:` and only the small packing helper is typed in (about 12 thousand). The skill reads that copy's version and SHA-256 first and runs it, but never changes or deletes it; a copy from before the colour grid sends QR codes in the terminal instead.
+Without `script:`, the skill types this repository's `qrxfer.py` into a temporary directory on the remote through the VNC keyboard (about 79 thousand characters). If qrxfer is already on the remote machine, pass its absolute path as `script:` and only the small packing helper is typed in (about 12 thousand). The skill reads that copy's version and SHA-256 first and runs it only when it is identical to this repository's `qrxfer.py`, but never changes or deletes it; for any other copy it falls back to typing in its own.
 
 The skill reuses or opens a VNC session, receives the files through the colour grid, verifies SHA-256 digests, the directory structure and symlinks item by item, and saves the result only after verification passes. The remote side needs no Tk; the grid window needs only libX11, and the terminal QR mode remains as a fallback. An external symlink is kept as a link; its target is not copied. The local helper's install step needs Python ≥ 3.12; packing on the remote side still needs only the Python ≥ 3.6 standard library.
 
@@ -165,7 +165,7 @@ Text files are compressed with xz first, so the effective file throughput is hig
 
 ## Security
 
-- **Encryption**: scrypt (N=2¹⁷, r=8, p=1, about 128 MiB of memory; PBKDF2-SHA256 with 2²⁰ iterations on old OpenSSL builds without scrypt) derives a 64-byte key from the passphrase and a 16-byte random salt. Half of it keys a SHAKE-256 keystream for encryption, the other half keys HMAC-SHA256 for authentication (encrypt-then-MAC). Every transfer gets a new salt and new keys. Archives of 512 MiB or more, which CPython's built-in SHAKE-256 (the only one on Python 3.6) cannot cover in one output, use a keystream made of 1 MiB pieces; receivers older than this change cannot decrypt those. Everything uses the Python standard library (hashlib/hmac, backed by OpenSSL or CPython's built-in implementations), so the remote machine needs no crypto library.
+- **Encryption**: scrypt (N=2¹⁷, r=8, p=1, about 128 MiB of memory; PBKDF2-SHA256 with 2²⁰ iterations on old OpenSSL builds without scrypt) derives a 64-byte key from the passphrase and a 16-byte random salt. Half of it keys a SHAKE-256 keystream for encryption, the other half keys HMAC-SHA256 for authentication (encrypt-then-MAC). Every transfer gets a new salt and new keys. The keystream is made of 1 MiB pieces, because CPython's built-in SHAKE-256 (the only one on Python 3.6) cannot produce 512 MiB or more in one output. Everything uses the Python standard library (hashlib/hmac, backed by OpenSSL or CPython's built-in implementations), so the remote machine needs no crypto library.
 - **Integrity**: every frame carries a CRC32 and the whole payload an HMAC; a wrong passphrase or tampered data is rejected and nothing is written.
 - **What it protects against**: if the screen is photographed, recorded or seen by someone else, the file contents cannot be recovered without the passphrase.
 - **What to watch out for**: the passphrase is typed on the remote machine (through the VNC keyboard). **If the VNC connection itself is not encrypted** (no TLS or SSH tunnel), an eavesdropper on the network sees both the screen and the keystrokes, and the encryption is pointless. In that case:

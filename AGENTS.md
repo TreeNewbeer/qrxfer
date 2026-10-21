@@ -36,9 +36,8 @@ Guidance for coding agents working in this repository. User-facing documentation
 3. **Encryption**: stdlib only.
    - scrypt (`N=2^17, r=8, p=1`), falling back to PBKDF2 2^20 iterations where scrypt is unavailable.
    - SHAKE-256 keystream plus HMAC-SHA256, encrypt-then-MAC.
-   - Container magic `QXF1`: one SHAKE-256 output as long as the data.
-   - `QXF2` for data of 2^29 bytes (512 MiB) or more, which CPython's built-in SHAKE (the only one on Python 3.6) refuses: the same layout, the keystream made of 1 MiB pieces, SHAKE-256 of `b"qrxfer-v2-stream"` + key + 8-byte big-endian piece number.
-     Smaller data stays `QXF1`, so older receivers can still decrypt it.
+   - Container magic `QXF2`: the keystream is made of 1 MiB pieces, SHAKE-256 of `b"qrxfer-v2-stream"` + key + 8-byte big-endian piece number, because CPython's built-in SHAKE (the only one on Python 3.6) refuses 2^29 bytes (512 MiB) or more in one output.
+   - `QXF1` (one SHAKE-256 output as long as the data, 1.1.1 and older) was dropped; `decrypt` rejects it.
 4. **Archive**:
    - tar.xz packing.
    - Extraction into a staging dir with the tar `data` filter; files are never overwritten (`name (1).ext`).
@@ -80,13 +79,14 @@ Guidance for coding agents working in this repository. User-facing documentation
   - Avoid 3.7+ features (walrus, `int.bit_count`, `str.removeprefix`, `functools.cache`, runtime `list[int]` annotations).
   - Check with `vermin --no-tips qrxfer.py`; it must report `3.6`.
   - Receiver-only deps (numpy, libzbar/zxing-cpp) must stay lazily imported.
-- **Wire format is shared by two machines that may run different copies:**
+- **Both machines run the same qrxfer version; nothing is kept for compatibility with older copies.**
+  Drop old formats and code paths instead of carrying them along. Mismatched copies must still fail with a clear error, never with garbage, so the wire format below is versioned:
   - frame header `>BIIHIH` plus CRC32;
   - Base45 wrapped as `QX:` … `.`;
   - `_SplitMix64` / `repair_indices`;
-  - the `QXF1`/`QXF2` container layouts and keystreams (`_keystream_xor`), the size at which the sender switches to `QXF2`, and the KDF ids;
+  - the container layout and keystream (`_keystream_xor`) and the KDF ids;
   - the grid: one `frame_bytes` frame per row of cells, cell colour = 4×red + 2×green + blue from the 8 RGB cube corners, bits most significant first, zero-padded to 3×cols bits and XORed with the first 3×cols bits of bytes y×n … (y+1)×n of `grid_whitening` (SHAKE-256 of `b"qrxfer grid"`, n = ceil(3×cols/8), y = row from the top); the black/white timing ring around the cells; cells of at least 2 px.
-  - Any change needs a `FRAME_VERSION` (or container magic) bump, and must update the golden values in `FrameTest.test_wire_format_is_stable`, `GridFormatTest.test_wire_format_is_stable` and `CryptoTest.test_keystream_is_stable`.
+  - Any change needs a `FRAME_VERSION` (or container magic) bump, so that an older copy rejects it, and must update the golden values in `FrameTest.test_wire_format_is_stable`, `GridFormatTest.test_wire_format_is_stable` and `CryptoTest.test_keystream_is_stable`.
 - The repair **degree distribution** (`repair_degree`, `REPAIR_DEGREE_CAP = 256`) is sender-only, because the degree travels in each frame. It may be tuned freely; re-check the overhead with the fountain tests.
 - Also sender-only, since every QR code carries its own version and mask: `FRAME_MASK`, `AUTO_VERSIONS`, the block size and the layout.
   - Before raising `AUTO_VERSIONS` above 17, measure zbar: its decode time per byte rises steeply for bigger codes.
@@ -206,7 +206,7 @@ English is the only language of this repository.
 ## Conventions
 
 - Code style: `%`-formatting and the existing compact style; keep `qrxfer.py` a single file.
-- Project version lives in `__version__` (currently `1.1.1`).
+- Project version lives in `__version__` (currently `1.2.0`).
   - Versions skip any component containing `4` (`1.0.3` → `1.0.5`, `1.3.9` → `1.5.0`).
   - Don't bump for intermediate edits.
 - Documents have no `Revision History` table: git history is the record of revisions.

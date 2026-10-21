@@ -39,7 +39,7 @@ import time
 import unicodedata
 import zlib
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 
 class QrxferError(Exception):
@@ -210,7 +210,7 @@ def parse_frame_bytes(raw):
         raise ValueError("frame checksum mismatch")
     version, tid, blob_len, block_size, seq, degree = _FRAME_HDR.unpack_from(body)
     if version != FRAME_VERSION:
-        raise ValueError("unsupported frame version %d (upgrade qrxfer)" % version)
+        raise ValueError("unsupported frame version %d (run the same qrxfer version on both machines)" % version)
     frame = Frame(tid, blob_len, block_size, seq, degree, body[_FRAME_HDR.size:])
     if (block_size == 0 or blob_len == 0 or len(frame.payload) != block_size
             or degree == 0 or degree > frame.k or (seq < frame.k and degree != 1)):
@@ -396,12 +396,9 @@ class FountainDecoder:
 # SHAKE-256 keystream and authenticated with HMAC-SHA256 (encrypt-then-MAC).
 # ---------------------------------------------------------------------------
 
-CONTAINER_MAGIC = b"QXF1"
-# QXF1 uses one SHAKE-256 output as long as the data, but CPython's built-in SHAKE
-# (hashlib's only one on Python 3.6) refuses 2**29 bytes or more. Bigger data uses
-# QXF2: the same layout, with a keystream of 1 MiB pieces numbered after the key.
-CONTAINER_MAGIC_V2 = b"QXF2"
-_V1_MAX_LEN = (1 << 29) - 1
+# The keystream is made of 1 MiB SHAKE-256 pieces numbered after the key: CPython's
+# built-in SHAKE (hashlib's only one on Python 3.6) refuses 2**29 bytes or more at once.
+CONTAINER_MAGIC = b"QXF2"
 _STREAM_CHUNK = 1 << 20
 KDF_SCRYPT, KDF_PBKDF2 = 1, 2
 _CONTAINER_HDR = struct.Struct(">4sBBBB16s")  # magic, kdf, param a/b/c, salt
@@ -428,22 +425,16 @@ def _derive_keys(secret, kdf, a, b, c, salt):
     return key[:32], key[32:]
 
 
-def _keystream_xor(magic, key, data):
-    """data XOR the container's keystream, as a list of pieces of up to 1 MiB (whole-data
-    ints would need several copies of a big transfer in memory)."""
+def _keystream_xor(key, data):
+    """data XOR the keystream, as a list of pieces of up to 1 MiB (whole-data ints would
+    need several copies of a big transfer in memory)."""
     data, n = memoryview(data), len(data)
-    if magic == CONTAINER_MAGIC:
-        whole = memoryview(hashlib.shake_256(b"qrxfer-v1-stream" + key).digest(n))
-        streams = (whole[i:i + _STREAM_CHUNK] for i in range(0, n, _STREAM_CHUNK))
-    else:
-        streams = (hashlib.shake_256(b"qrxfer-v2-stream" + key + struct.pack(">Q", i // _STREAM_CHUNK))
-                   .digest(min(_STREAM_CHUNK, n - i)) for i in range(0, n, _STREAM_CHUNK))
-    out, pos = [], 0
-    for stream in streams:
-        size = len(stream)
+    out = []
+    for pos in range(0, n, _STREAM_CHUNK):
+        size = min(_STREAM_CHUNK, n - pos)
+        stream = hashlib.shake_256(b"qrxfer-v2-stream" + key + struct.pack(">Q", pos // _STREAM_CHUNK)).digest(size)
         out.append((int.from_bytes(data[pos:pos + size], "little") ^ int.from_bytes(stream, "little"))
                    .to_bytes(size, "little"))
-        pos += size
     return out
 
 
@@ -451,9 +442,7 @@ def encrypt(plaintext, secret):
     params = (KDF_SCRYPT, 17, 8, 1) if hasattr(hashlib, "scrypt") else (KDF_PBKDF2, 20, 0, 0)
     salt = os.urandom(16)
     enc_key, mac_key = _derive_keys(secret, *(params + (salt,)))
-    # Data that QXF1 can hold stays QXF1, which older receivers can decrypt.
-    magic = CONTAINER_MAGIC if len(plaintext) <= _V1_MAX_LEN else CONTAINER_MAGIC_V2
-    parts = [_CONTAINER_HDR.pack(magic, *(params + (salt,)))] + _keystream_xor(magic, enc_key, plaintext)
+    parts = [_CONTAINER_HDR.pack(CONTAINER_MAGIC, *(params + (salt,)))] + _keystream_xor(enc_key, plaintext)
     mac = hmac.new(mac_key, digestmod=hashlib.sha256)
     for part in parts:
         mac.update(part)
@@ -465,15 +454,16 @@ def decrypt(blob, secret):
     magic = blob[:4]
     if len(blob) < _CONTAINER_HDR.size + _TAG_LEN or not magic.startswith(b"QXF"):
         raise QrxferError("this is not qrxfer encrypted data")
-    if magic not in (CONTAINER_MAGIC, CONTAINER_MAGIC_V2):
-        raise QrxferError("unsupported encrypted data format %r (upgrade qrxfer)" % magic.decode("latin-1"))
+    if magic != CONTAINER_MAGIC:
+        raise QrxferError("unsupported encrypted data format %r (run the same qrxfer version on both machines)"
+                          % magic.decode("latin-1"))
     _, kdf, a, b, c, salt = _CONTAINER_HDR.unpack_from(blob)
     enc_key, mac_key = _derive_keys(secret, kdf, a, b, c, salt)
     view = memoryview(blob)
     body, tag = view[:-_TAG_LEN], bytes(view[-_TAG_LEN:])
     if not hmac.compare_digest(hmac.new(mac_key, body, hashlib.sha256).digest(), tag):
         raise WrongPassphrase("wrong passphrase (or corrupted data)")
-    return b"".join(_keystream_xor(magic, enc_key, body[_CONTAINER_HDR.size:]))
+    return b"".join(_keystream_xor(enc_key, body[_CONTAINER_HDR.size:]))
 
 
 # Generated passphrases: 16 Crockford base32 characters (80 bits) in 4 groups.
