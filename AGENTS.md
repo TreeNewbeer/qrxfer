@@ -17,10 +17,10 @@ Guidance for coding agents working in this repository. User-facing documentation
 | Path | Purpose |
 |---|---|
 | `qrxfer.py` | The whole program, a single file meant to be copied to both machines |
-| `tests/test_qrxfer.py` | unittest suite (42 tests; `tests/test_skill_transfer.py` covers the skill helper) |
+| `tests/test_qrxfer.py` | unittest suite (46 tests; `tests/test_skill_transfer.py` covers the skill helper) |
 | `install.sh` | Copies `qrxfer.py` to `~/.local/bin/qrxfer` (or `$QRXFER_BIN_DIR`), then runs `selftest` |
 | `README.md` | User guide |
-| `skills/qrxfer/` | Shared VNC download skill and deterministic helper (prepare, type, bundle, install, keepawake) |
+| `skills/qrxfer/` | Shared VNC download skill and deterministic helper (prepare, place, type, bundle, install, keepawake) |
 
 `qrxfer.py` sections, in file order:
 
@@ -39,7 +39,10 @@ Guidance for coding agents working in this repository. User-facing documentation
    - Container magic `QXF2`: the keystream is made of 1 MiB pieces, SHAKE-256 of `b"qrxfer-v2-stream"` + key + 8-byte big-endian piece number, because CPython's built-in SHAKE (the only one on Python 3.6) refuses 2^29 bytes (512 MiB) or more in one output.
    - `QXF1` (one SHAKE-256 output as long as the data, 1.1.1 and older) was dropped; `decrypt` rejects it.
 4. **Archive**:
-   - tar.xz packing.
+   - tar.xz packing on every core (`XzWriter`, `xz_threads`, `send --threads`), like `xz -T0`:
+     - The tar stream is cut into `XZ_CHUNK` (24 MiB) pieces, each compressed into an independent .xz stream by `lzma.compress` in a thread pool; lzma releases the GIL, also on Python 3.6.
+     - xz, `lzma` and tarfile read the concatenated streams as one file, so the receiver needs nothing new.
+     - One thread per usable core, within a quarter of the RAM at 200 MiB per thread. The skill's `bundle` has its own copy of the writer, since the helper is typed in alone.
    - Extraction into a staging dir with the tar `data` filter; files are never overwritten (`name (1).ext`).
 5. **QR encoder**: pure Python; alphanumeric mode, versions 1–40, levels L/M/Q/H.
    - Speed matters: the sender's CPU was the bottleneck on a real Python 3.6 remote.
@@ -56,18 +59,23 @@ Guidance for coding agents working in this repository. User-facing documentation
 7. **Colour grid sender** (the default codec):
    - `plan_cells`: odd numbers of 3 px cells, a one-cell black/white timing ring and a one-cell black margin.
    - `GridStream`: one binary frame (`frame_bytes`) per row; after the first pass, each screen of repair frames is followed by one screen repeating the systematic frames, or three from k ≥ 2^16 (`MANY_REPEATS_K`).
+     Round c of repeats (`repeat_block`) shows every block (c + 1) × 0.382 × rows (mod rows) rows above its row in the first pass, so a band of rows covered on the receiver's screen hides other blocks each round; aligned repeats hid the same ones again.
      Every screen after the first pass makes an equal share of the next repair screen, so all screens take about as long to make and stay up about as long.
    - `GridPainter`: pure-Python BGRX painting (one `join` over pre-rendered cells per line; frames become octal digits through a big-int XOR with the row's whitening).
    - `X11GridWindow` (libX11 through ctypes, prototypes in `_xlib()`): override-redirect full-screen window, `XPutImage` + `XSync`, keyboard grab (keys typed into the VNC viewer), hidden pointer, status line drawn with `XDrawImageString`.
    - `run_x11_grid_sender` installs SIGINT/SIGTERM handlers itself: a background job may start with SIGINT ignored.
 8. **Receiver**:
-   - `XlibGrabber` (ctypes `XGetImage`); `grab(..., colour=True)` returns raw pixels, `.channels` gives the red/green/blue byte indices.
+   - `XlibGrabber`: MIT-SHM (`XShmGetImage` into a SysV segment per region size, ctypes libXext) when the X server shares memory with this client, else `XGetImage`; `grab(..., colour=True)` returns raw pixels (a copy), `.channels` gives the red/green/blue byte indices.
+     - Captures must come more often than screens change: through a VNC hop at ~11.7 fps, 1.4× and more lost little, 0.9× needed twice the screens and 0.55× five times.
+     - With the viewer redrawing, `XGetImage` of 2560×1351 averaged 56 ms (up to 160 ms) on the real desktop; MIT-SHM takes half to a third.
    - Decoders `ZxingDecoder` (zxing-cpp) and `ZbarDecoder` (ctypes libzbar).
      - zbar returns nothing for an image with one torn code, so it scans each band between blank pixel rows (`_code_bands`) separately.
      - Each band gets a line-skipping pass first, then a full-density pass when that finds nothing or fewer codes than last time.
    - Grid: `locate_grid` finds the densest block of saturated colours, then reads every cell boundary from the timing rings (top/left first, bottom/right when covered); `read_grid_rows` samples cell centres with numpy.
      - `GridGeometry.complete` means the bottom ring was seen: a viewer draws the first screen top-down, and a capture half-way must not fix too few rows.
    - Readers: `QrReader`, `GridReader` (geometry shared by its clones, searched again on full captures, every 0.5 s while incomplete, and when a capture yields nothing), `AutoReader` (both; cropped captures use the kind found last).
+     - `GridReader._watch`: rows failing in ≥ 90 % of a clone's last 40 captures are covered (a dock over the viewer); `collect_from_screen` prints that once a minute through `Progress.note`.
+   - `Progress`: the rate of the last 30 s and the average since the first frame; the ETA uses the recent rate.
    - `RegionTracker` (crops to the codes, rescans the full screen every 4 s).
    - `collect_from_screen`: grabs on the main thread and decodes in `threads` worker threads, each with its own reader clone (ctypes and numpy release the GIL).
 9. **Commands**: `send`, `recv`, `decrypt`, `genpass`, `selftest`, wired up in `build_parser`.
@@ -206,7 +214,7 @@ English is the only language of this repository.
 ## Conventions
 
 - Code style: `%`-formatting and the existing compact style; keep `qrxfer.py` a single file.
-- Project version lives in `__version__` (currently `1.2.0`).
+- Project version lives in `__version__` (currently `1.2.1`).
   - Versions skip any component containing `4` (`1.0.3` → `1.0.5`, `1.3.9` → `1.5.0`).
   - Don't bump for intermediate edits.
 - Documents have no `Revision History` table: git history is the record of revisions.
@@ -230,8 +238,8 @@ This repository is public. Never add anything that identifies a person, a specif
 ## Known limitations / possible future work
 
 - One direction only (see above); Wayland-only sessions may not be capturable with `XGetImage`.
-- Region capture costs 10–30 ms and a full-screen grab ~73 ms on this machine; XShm could speed it up if needed.
-- Practical for KB to tens of MB (grid measured up to 20 MB); time grows linearly with size.
+- Captures of a 2560×1351 region on this machine (idle screen): `XGetImage` median 10.6 ms, MIT-SHM 3.5–4.4 ms; both slow down while the viewer redraws (see `XlibGrabber`).
+- Practical for KB to hundreds of MB (grid measured up to 857 MB on the real link); time grows linearly with size.
   - A 600 MB transfer crashed a Python 3.6 sender in `encrypt` (fixed by `QXF2`). The decoder for its k ≈ 2 million blocks was simulated offline (2560×1351 grid, 439 rows per screen, first-pass loss 2 % as measured on the real link): done 517 screens after the first pass, 151 s of decoder CPU, 2.3 GB peak. The old decoder passed 8.8 GB and kept slowing down.
   - The tail is a coupon collector: each repair frame names ~192 of k blocks, so the last missing blocks need ~k/192 × ln(missing) frames; with much higher loss, elimination over tens of thousands of rows makes the decoder the bottleneck (5 % simulated: 577 screens, 930 s of decoder CPU plus 83 s in `result()`, 2.85 GB).
   - The real link (2026-10-20, 571 MB, k = 2,015,968, Python 3.6 sender at ~6 fps, 1.1.0 code) was much slower than that simulation, which assumed every screen gets read:
@@ -249,8 +257,27 @@ This repository is public. Never add anything that identifies a person, a specif
     - When 30 % of all screens are lost, the late receiver takes 40 min: each round of repeat screens fills only 70 % of the gaps.
   - Through a local TigerVNC hop (Python 3.6 sender in Docker, 20 MB = 67,346 blocks, single runs), receiver started 45 s after the sender: 1.1.0 83 s; one repeat screen per repair screen 40–44 s; three 20 s.
     Receiver started first: 27 s with one or three. The time-driven model agrees (late: 25–31 s against 52–64 s; first: equal), hence three repeat screens from 2^16 blocks.
+  - A 1.9 GB source tree (18,925 files) through the real link on 2026-10-21 (skill run, 1.2.0 sender on Python 3.6): the grid appeared only after 32 minutes, 26 of them in single-threaded xz, hence `XzWriter`.
+    - The skill's `bundle` (preset 6, 1.9 GB → 857 MB) took 18 min; `send` repacking that already-compressed payload (preset 6e) took 7.5 min more, before its passphrase prompt.
+    - Python 3.6 in Docker pinned to 6 cores, after the change: bundling a 78 MB tree 31.6 → 12.1 s (four chunks), repacking 192 MiB of incompressible data 94 → 26 s (eight chunks, two rounds).
+    - Then k = 2,887,084, timed from the first frame: the first pass took 9.9 min at 1.32–1.45 MB/s and left 4.6 % missing. Repeats alone (repair frames skipped above 32,768 missing) took 19.2 min more at 5–70 KB/s, the sender at 5.4–7.7 fps; repair frames then finished in 3.6 min.
+      The progress line showed the average since the first frame, which fell to 433 KB/s and looked like a slowing link; hence the recent rate beside it.
+    - A local dock (48 px, hidden while the viewer is the active window) covered the viewer's bottom 49 px whenever another window was active: grid rows 432–439 and the bottom ring failed in every capture, and the first round of repeats showed those blocks in the same rows again.
+      Hence the shifted repeat rounds, the covered-row notice and the skill's `place`.
+    - The time-driven model with this run's k and sender timing (first pass 0.0905 s per screen, 0.62 ms per repair frame made) and 4.6 % of screens lost: complete at 31.2 min (real: 32.7 min).
+      - Skipping repair frames only above 131,072 missing blocks: 39.8 min; never: 42.8 min (decoder CPU 1,600–1,800 s, so most screens are missed).
+      - The bottom 8 rows covered on every capture: aligned repeats 47.5 min, shifted repeats 33.5 min.
+      - 2 % of screens lost: 24.9 min; 1 %: 13.7 min, since fewer than 32,768 blocks are missing right after the first pass.
+    - Through a local VNC hop (Xtigervnc 1.15 → TigerVNC viewer on Xvfb, 20 MB, single runs): `--fps 20`, `25` and `30` all ran at 11.1–11.2 fps, the sender's own limit.
+      Captures per screen, by slowing the receiver's grabs: 2.1×: 1.23 screens shown per screen of data; 1.6×: 1.07; 1.4×: 1.08; 0.9×: 1.97; 0.55×: 5.06.
+  - Retest through the same real link that evening: 1.2.1 on both sides (the remote `script:` copy updated first), a skill run with `script:`, the viewer moved with `place`, a 351 MB test tree of 12,336 files (Python's stdlib, documentation, 150 MB of random data).
+    - `bundle` took 30 s on the remote's 56 cores (single-threaded `xz -6` of the same tar: 3:42) and wrote 202.6 MB; `send` reached its passphrase prompt 16–21 s after the command was typed, and showed the grid 7 s after the second passphrase.
+    - k = 683,902, timed from the first frame: the first pass took 2:05 at 1.5–1.6 MB/s (about 12.5 screens per second; the status line showed 14.8 fps at 23 %) and left 1.4 % missing.
+      That is under 32,768 blocks, so repair frames took over at once (sender at 5.6 fps) and brought the rest in 43 s; complete after 2:48, decrypted and saved 2 s later. No covered-row notice; `install` passed.
+    - Typing the 94-thousand-character bootstrap through the viewer lost keys once (zlib error before anything was created); the second attempt worked (1:48 and 2:10 of typing).
 - The grid needs a 24-bit X display on the sender; it covers the whole screen, so the remote desktop is unusable while sending.
 - Terminal mode is bounded by the terminal's redraw rate, not by qrxfer.
 - Screensavers on either side hide the grid. Both idle timers start at the last keystroke typed through the viewer, so both fire in the middle of a long transfer (seen after 30 min on both sides, receiver stalled until woken). Keep both awake: pointer motion over the viewer wakes the remote without sending the sender a key; the skill's `keepawake` helper does that every 4 minutes.
+- The skill still compresses twice: `send` packs and xz-compresses the bundle's payload.tar.xz again, now on every core but for nothing; a store-only pack for already-compressed input would save that pass.
 - Elimination still runs on the capture loop's thread. A decoder thread with a bounded queue of repair frames would keep the capture going while it works, at the price of GIL contention.
 - The grid sender's repair phase is CPU-bound in Python (`repair_indices`); a lower repair degree for large k could help, re-check the overhead with the fountain tests.

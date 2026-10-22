@@ -102,7 +102,7 @@ This is a skill invocation run by an agent, not a shell command. It requires the
 ## Command reference
 
 ```
-qrxfer send FILE_OR_DIR...  [-p FILE] [--codec auto|grid|qr] [--fps 12] [--cell-px 3]
+qrxfer send FILE_OR_DIR...  [-p FILE] [--codec auto|grid|qr] [--fps 12] [--cell-px 3] [--threads N]
                             QR codes: [--density auto|low|medium|high|BYTES] [--grid auto|COLSxROWS]
                             [--max-codes 24] [--min-px 4] [--ecc L|M|Q|H] [--terminal] [--windowed]
 qrxfer recv    [-o DIR] [-p FILE] [--codec auto|grid|qr] [--decoder auto|zxing|zbar] [--region X,Y,W,H]
@@ -120,7 +120,8 @@ qrxfer selftest
 - `--density`: data carried by each QR code. The default `auto` picks, when sending starts, the code size (versions 10–17) that puts the most data on one screen for the display area. The code size stays fixed for the whole transfer, so in terminal mode **set the window size and font size before starting**. It can also be fixed as `low` = 300 B, `medium` = 600 B (version 17-L), `high` = 1000 B, or a byte count.
 - `--grid`: layout of codes on each screen. The default `auto` fits as many codes as possible (at most `--max-codes`) while keeping modules at least `--min-px` pixels. `COLSxROWS` fixes the layout; for example `--grid 6x2` means 6 on top and 6 below. With `--density auto`, the largest code that fits that layout is chosen.
 - `--region`: only watch one part of the screen (rarely needed; the codes are located automatically).
-- `--threads N`: number of captures decoded at the same time; by default the CPU count minus 1, at most 4.
+- `--threads N` (send): compression threads; by default one per CPU, within a quarter of the RAM (like `xz -T0`). The archive is cut into 24 MiB pieces that are compressed at the same time, so this matters from about 50 MB on; on one core, xz manages only 1–2 MB/s.
+- `--threads N` (recv): number of captures decoded at the same time; by default the CPU count minus 1, at most 4.
 - When decryption fails (wrong passphrase) you get 3 retries; after that the encrypted data is saved as `qrxfer-YYYYMMDD-HHMMSS.qxf`, so you can retry later with `qrxfer decrypt` without sending again.
 
 ## Speed and tuning
@@ -138,8 +139,13 @@ Measured on 2026-10-13 through a real TurboVNC link on a LAN: a 2560×1351 remot
 
 - The time includes about 9 s in which the Python 3.6 sender compresses and encrypts 20 MB before it shows the grid; `recv` measures its rate from the first frame.
 - The sender reached about 8 screens per second in the first pass and about 4 later, when it also computes repair frames. Most of a frame's time goes to the X server, which encodes the screen for VNC; painting takes 38 ms in Python 3.6.
+- On 2026-10-21, version 1.2.1 through the same link (a skill run, the viewer moved clear of a dock): a 351 MB tree of 12,336 files, 203 MB once compressed, took 30 s to bundle and about 20 s to repack on the remote's 56 cores, then 2:48 on screen from the first frame. The first pass ran at 1.5–1.6 MB/s (about 12.5 screens per second) and left 1.4 % of the blocks missing; the repair frames brought them in 43 s.
 - In a channel test before this design, cells of up to 64 colours arrived bit-exact over the same link, even with the viewer forced to the lowest JPEG quality: VNC encoders use JPEG only for smooth, photo-like areas. The 8 cube-corner colours keep the largest possible distance, so they also survive VNC servers that do compress more colours.
 - Keep the VNC view at 100 % scale and the whole remote screen visible. A scaled view still works (the timing rings give every cell boundary), but blends colours at cell edges.
+- `--fps` is a ceiling: when the status line shows the actual value below the target, `+` changes nothing. Through a local VNC hop the sender ran at 11.1–11.2 screens per second with `--fps 20`, `25` and `30` alike.
+- The receiver has to capture more often than the screens change. Through that hop, 1.4 or more captures per screen lost little; 0.9 needed twice as many screens and 0.55 five times as many. `recv` captures through MIT-SHM when it can, which takes half to a third of the time of `XGetImage` (56 ms for a 2560×1351 region on a busy desktop).
+- `recv`'s progress line shows the rate of the last 30 seconds and, in brackets, the average since the first frame. After the first pass the recent rate drops sharply: each later screen carries only the few blocks still missing, until the repair frames take over. That is normal as long as the block count keeps rising.
+- Nothing may cover any part of the grid, not even now and then: an auto-hiding dock along the screen's edge pops up over the VNC viewer whenever another window is active, and hides the same rows of every screen. `recv` prints which rows (and screen y) keep failing; move the viewer clear of the dock.
 
 ### QR codes
 
@@ -177,7 +183,7 @@ Text files are compressed with xz first, so the effective file throughput is hig
 
 - The screen channel is one-way: files can only go from **the side that shows the screen (VNC server / remote)** to **the side that watches it (local)**. Local → remote is not possible this way.
 - Screen capture on the receiver needs X11 (XFCE, MATE and other X11 sessions all work); in a pure Wayland session the window contents may not be capturable. The grid window on the sender likewise needs an X11 display with 24-bit colour; otherwise use QR codes (`--terminal`).
-- Suited to files from KB to tens of MB (measured up to 20 MB with the grid); time grows linearly with size (see the tables above). Hundreds of MB take tens of minutes: a Python 3.6 sender spends minutes compressing them, and a 2560×1351 screen of 3-pixel cells carries about 127 KB, so 600 MB needs some 4,700 screens. A 571 MB transfer over a real VNC link took 3.5 hours with version 1.1.0, whose receiver fell behind while solving repair frames. Simulated with that link's timing, the current version takes about 8–15 minutes, whether the receiver starts first or joins late.
+- Suited to files from KB to hundreds of MB; time grows linearly with size (see the tables above). Hundreds of MB take minutes to tens of minutes: the sender compresses on all its cores (on one core, xz needs about 10 minutes per GB), and a 2560×1351 screen of 3-pixel cells carries about 127 KB, so 600 MB needs some 4,700 screens. Over a real VNC link, 203 MB took under 3 minutes on screen with version 1.2.1 (see above), and 857 MB 33 minutes with version 1.2.0, while a dock covered the viewer's bottom rows. A 571 MB transfer took 3.5 hours with version 1.1.0, whose receiver fell behind while solving repair frames.
 
 ## Development and testing
 

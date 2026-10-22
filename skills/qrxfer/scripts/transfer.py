@@ -3,10 +3,14 @@
 
 import argparse
 import base64
+import collections
+import concurrent.futures
 import ctypes
+import ctypes.util
 import errno
 import hashlib
 import json
+import lzma
 import os
 import re
 import secrets
@@ -119,6 +123,73 @@ def check_viewer(window):
         raise ValueError('The target window is not a VNC viewer')
 
 
+def window_geometry(window):
+    info = subprocess.check_output(['xwininfo', '-id', str(window)], universal_newlines=True)
+    get = lambda label: int(re.search(label + r':\s*(-?\d+)', info).group(1))
+    return {'window': window, 'x': get('Absolute upper-left X'), 'y': get('Absolute upper-left Y'),
+            'width': get('Width'), 'height': get('Height')}
+
+
+class ClientMessage(ctypes.Structure):
+    _fields_ = [('type', ctypes.c_int), ('serial', ctypes.c_ulong), ('send_event', ctypes.c_int),
+                ('display', ctypes.c_void_p), ('window', ctypes.c_ulong), ('message_type', ctypes.c_ulong),
+                ('format', ctypes.c_int), ('data', ctypes.c_long * 5), ('pad', ctypes.c_long * 19)]
+
+
+def place(args):
+    # A dock along the screen's bottom edge hid the grid's last rows from recv; one that
+    # hides itself pops up whenever another window is active. Undecorated and moved up
+    # against the top of the work area, the viewer leaves at most the remote status line
+    # under such a dock. --restore puts the decorations back and maximizes it again.
+    check_viewer(args.window)
+    x11 = ctypes.CDLL(ctypes.util.find_library('X11'))
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XInternAtom.restype = x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XDefaultRootWindow.argtypes = x11.XFlush.argtypes = x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    x11.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_long, ctypes.c_void_p]
+    x11.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+                                    ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise ValueError('Cannot open the X display')
+
+    def message(name, *data):
+        event = ClientMessage(type=33, window=args.window, format=32,
+                              message_type=x11.XInternAtom(display, name.encode(), 0))
+        event.data[:len(data)] = [x11.XInternAtom(display, d.encode(), 0) if isinstance(d, str) else d
+                                  for d in data]
+        # SubstructureRedirect | SubstructureNotify on the root reaches the window manager.
+        x11.XSendEvent(display, x11.XDefaultRootWindow(display), 0, 3 << 19, ctypes.byref(event))
+        x11.XFlush(display)
+        time.sleep(0.3)
+
+    def decorate(on):
+        # Motif hints, which xfwm4 and others read only with their own property type.
+        hints, atom = (ctypes.c_long * 5)(2, 0, int(on), 0, 0), x11.XInternAtom(display, b'_MOTIF_WM_HINTS', 0)
+        x11.XChangeProperty(display, args.window, atom, atom, 32, 0, hints, 5)
+        x11.XFlush(display)
+        time.sleep(0.3)
+
+    maximized = ('_NET_WM_STATE_MAXIMIZED_VERT', '_NET_WM_STATE_MAXIMIZED_HORZ', 2)
+    try:
+        if args.restore:
+            decorate(True)
+            message('_NET_WM_STATE', 1, *maximized)
+        else:
+            if args.y is None:
+                area = subprocess.check_output(['xprop', '-root', '_NET_WORKAREA'], universal_newlines=True)
+                args.y = int(re.findall(r'\d+', area.split('=', 1)[1])[1])
+            x = window_geometry(args.window)['x'] if args.x is None else args.x
+            decorate(False)
+            message('_NET_WM_STATE', 0, *maximized)
+            # StaticGravity: x and y are the window's own position; source: a pager.
+            message('_NET_MOVERESIZE_WINDOW', 10 | 3 << 8 | 2 << 12, x, args.y)
+    finally:
+        x11.XCloseDisplay(display)
+    print(json.dumps(window_geometry(args.window)))
+
+
 def type_file(args):
     check_viewer(args.window)
     with open(args.file, 'rb') as source:
@@ -186,6 +257,48 @@ def paths_in(root):
                 yield os.path.relpath(path, root), path
 
 
+XZ_CHUNK = 24 << 20  # like xz -T: three times the 8 MiB dictionary of preset 6
+
+
+class XzWriter:
+    """Write-only file that compresses on every core like xz -T0 (within a quarter of
+    the RAM): each XZ_CHUNK bytes become an independent .xz stream, and xz and tarfile
+    read the concatenation as one file. lzma releases the GIL while it compresses."""
+
+    def __init__(self, out, preset):
+        # 200 MiB per thread: a preset 6 encoder (94 MiB) plus chunks waiting in and out.
+        memory = os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
+        self.threads = max(1, min(len(os.sched_getaffinity(0)), memory // 4 // (200 << 20)))
+        self.out, self.preset = out, preset
+        self.pool = concurrent.futures.ThreadPoolExecutor(self.threads)
+        self.buf, self.jobs, self.empty = bytearray(), collections.deque(), True
+
+    def write(self, data):
+        self.buf += data
+        if len(self.buf) >= XZ_CHUNK:
+            self.submit()
+        return len(data)
+
+    def submit(self):
+        self.jobs.append(self.pool.submit(lzma.compress, bytes(self.buf), preset=self.preset))
+        self.buf, self.empty = bytearray(), False
+        while len(self.jobs) > 2 * self.threads:
+            self.out.write(self.jobs.popleft().result())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        if kind is None:
+            if self.buf or self.empty:
+                self.submit()
+            while self.jobs:
+                self.out.write(self.jobs.popleft().result())
+        for job in self.jobs:
+            job.cancel()
+        self.pool.shutdown()
+
+
 class HashReader:
     def __init__(self, source):
         self.source = source
@@ -213,7 +326,8 @@ def bundle(args):
     if os.path.lexists(archive_path) or os.path.lexists(manifest_path):
         raise ValueError('Bundle output already exists; use a fresh workspace')
     entries = {}
-    with tarfile.open(archive_path, 'w:xz', preset=6) as archive:
+    with open(archive_path, 'xb') as raw, XzWriter(raw, 6) as packed, \
+            tarfile.open(fileobj=packed, mode='w|') as archive:
         for rel, path in paths_in(root):
             before = os.lstat(path)
             if not any(check(before.st_mode) for check in
@@ -382,6 +496,12 @@ def main():
     p.add_argument('--script', help='qrxfer already on the remote (absolute path); '
                    'only the helper is installed then')
     p.set_defaults(run=prepare)
+    p = commands.add_parser('place', help='move the VNC viewer clear of docks at the bottom edge')
+    p.add_argument('--window', type=int, required=True)
+    p.add_argument('--x', type=int, help='left edge (default: where it is)')
+    p.add_argument('--y', type=int, help='top edge (default: the top of the work area)')
+    p.add_argument('--restore', action='store_true', help='decorate and maximize it again')
+    p.set_defaults(run=place)
     p = commands.add_parser('type', help='type one file into a specific VNC window')
     p.add_argument('--window', type=int, required=True)
     p.add_argument('--file', required=True)

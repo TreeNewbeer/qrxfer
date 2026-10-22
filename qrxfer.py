@@ -39,7 +39,7 @@ import time
 import unicodedata
 import zlib
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 
 class QrxferError(Exception):
@@ -545,13 +545,70 @@ def _unique_path(path):
     return candidate
 
 
-def pack_paths(paths):
+XZ_CHUNK = 24 << 20  # like xz -T: three times the 8 MiB dictionary of preset 6
+XZ_THREAD_MEMORY = 200 << 20  # a preset 6 encoder (94 MiB) plus chunks waiting in and out
+
+
+def xz_threads():
+    """One compression thread per usable core, within a quarter of the RAM (like xz -T0)."""
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cores = os.cpu_count() or 1
+    try:
+        ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        return cores
+    return max(1, min(cores, ram // 4 // XZ_THREAD_MEMORY))
+
+
+class XzWriter(object):
+    """Write-only file that compresses on several threads, like xz -T: every XZ_CHUNK
+    bytes become an independent .xz stream, and xz, lzma and tarfile read the
+    concatenated streams as one file. lzma releases the GIL while it compresses."""
+
+    def __init__(self, out, preset, threads):
+        import lzma
+        from concurrent.futures import ThreadPoolExecutor
+        self.out, self.preset, self.threads, self.compress = out, preset, threads, lzma.compress
+        self.pool = ThreadPoolExecutor(threads)
+        self.buf, self.jobs, self.empty = bytearray(), collections.deque(), True
+
+    def write(self, data):
+        self.buf += data
+        if len(self.buf) >= XZ_CHUNK:
+            self._submit()
+        return len(data)
+
+    def _submit(self):
+        self.jobs.append(self.pool.submit(self.compress, bytes(self.buf), preset=self.preset))
+        self.buf, self.empty = bytearray(), False
+        while len(self.jobs) > 2 * self.threads:  # bounds the memory in flight
+            self.out.write(self.jobs.popleft().result())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, tb):
+        if kind is None:
+            if self.buf or self.empty:  # an empty input still makes one valid stream
+                self._submit()
+            while self.jobs:
+                self.out.write(self.jobs.popleft().result())
+        for job in self.jobs:
+            job.cancel()
+        self.pool.shutdown()
+
+
+def pack_paths(paths, threads=None):
     """Return (tar archive bytes, number of files, total file bytes)."""
+    buf = io.BytesIO()
     try:
         import lzma
-        mode, kwargs = "w:xz", {"preset": 6 | lzma.PRESET_EXTREME}
+        out = XzWriter(buf, 6 | lzma.PRESET_EXTREME, threads or xz_threads())
     except ImportError:
-        mode, kwargs = "w:gz", {"compresslevel": 9}
+        import gzip
+        out = gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=9)
     stats = [0, 0]
 
     def clean(info):
@@ -564,9 +621,8 @@ def pack_paths(paths):
             stats[1] += info.size
         return info
 
-    buf = io.BytesIO()
     used = set()
-    with tarfile.open(fileobj=buf, mode=mode, **kwargs) as tar:
+    with out, tarfile.open(fileobj=out, mode="w|") as tar:
         for path in paths:
             if not os.path.lexists(path):
                 raise QrxferError("no such file or directory: %s" % path)
@@ -1371,6 +1427,11 @@ class GridStream:
     next repair screen, so all screens take about as long to make and stay up about as
     long: made at once, the repair frames kept the screen before them up four times as
     long as the repair screen itself.
+
+    Each round of repeats puts every block a different number of rows away from where
+    the first pass showed it (golden-section steps): a band of rows covered on the
+    receiver's screen, such as a dock popping up over the bottom of the VNC viewer, then
+    hides different blocks every time instead of the same ones.
     """
 
     unit = "row"
@@ -1380,7 +1441,8 @@ class GridStream:
         self.encoder, self.cols, self.rows = encoder, cols, rows
         self.seq = 0  # frames shown
         self.repeats = 3 if encoder.k >= self.MANY_REPEATS_K else 1
-        self._repair, self._repeat, self._after = encoder.k, 0, 0
+        self._repair, self._repeat, self._after = encoder.k, 0, 0  # _repeat: repeat frames shown
+        self._step = max(1, int(rows * 0.381966 + 0.5)) if rows > 1 else 0  # rows shifted per round
         self._ahead = []  # frames of the next repair screen, made in shares
 
     def phase(self):
@@ -1392,6 +1454,15 @@ class GridStream:
         self._repair += count
         return out
 
+    def repeat_block(self, n):
+        """Block shown as repeat frame n. Repeat frames fill whole screens, so frame n sits
+        in row n % rows; round c starts at a block below `rows` chosen so that each block
+        lands (c + 1) * _step rows (mod rows) above its row in the first pass."""
+        k, rows = self.encoder.k, self.rows
+        c, j = divmod(n, k)
+        start = (c * k + (c + 1) * self._step) % rows if rows > 1 else 0
+        return (j + start) % k
+
     def take(self, count):
         k = self.encoder.k
         if self.seq < k:  # the first pass; its last screen is filled up with repair frames
@@ -1400,10 +1471,9 @@ class GridStream:
             out += self._repairs(count - n)
         else:
             if self._after % (self.repeats + 1):
-                out = []
-                for _ in range(count):
-                    out.append(frame_bytes(self.encoder.frame(self._repeat)))
-                    self._repeat = (self._repeat + 1) % k
+                out = [frame_bytes(self.encoder.frame(self.repeat_block(n)))
+                       for n in range(self._repeat, self._repeat + count)]
+                self._repeat += count
             else:
                 out, self._ahead = self._ahead[:count], self._ahead[count:]
                 out += self._repairs(count - len(out))
@@ -1682,10 +1752,21 @@ def _need_numpy():
         raise QrxferError("numpy is required to receive: sudo apt install python3-numpy (or pip install numpy)")
 
 
+class _XShmSegmentInfo(ctypes.Structure):
+    _fields_ = [("shmseg", ctypes.c_ulong), ("shmid", ctypes.c_int), ("shmaddr", ctypes.c_void_p),
+                ("readOnly", ctypes.c_int)]
+
+
 class XlibGrabber:
-    """Screen capture through libX11's XGetImage (any region of the root window)."""
+    """Screen capture of any region of the root window: through MIT-SHM when the X server
+    offers it for this connection (a shared memory segment per region size), otherwise
+    through XGetImage. Each screen must be caught while it is up, and receiving falls
+    apart once captures come less often than screens change (measured through a VNC hop).
+    With the VNC viewer redrawing, an XGetImage of a 2560x1351 region took 56 ms on
+    average and up to 160 ms on a real desktop; MIT-SHM takes half to a third of that."""
 
     name = "Xlib"
+    SHM_SIZES = 4  # region sizes that keep a segment
 
     def __init__(self):
         self.np = _need_numpy()
@@ -1706,6 +1787,79 @@ class XlibGrabber:
             self.channels = _pixel_format(img)[1]  # byte index of red, green, blue
         finally:
             x.XDestroyImage(img)
+        self._shm, self._segments = None, collections.OrderedDict()
+        try:
+            self._shm_open(screen)
+        except (OSError, AttributeError, QrxferError):
+            self._shm_close()
+
+    def _shm_open(self, screen):
+        xext = ctypes.CDLL(ctypes.util.find_library("Xext") or "libXext.so.6")
+        libc = ctypes.CDLL(None, use_errno=True)
+        vp, ul, i, ui = ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_uint
+        info = ctypes.POINTER(_XShmSegmentInfo)
+        for lib, name, res, args in (
+                (xext, "XShmQueryExtension", i, [vp]),
+                (xext, "XShmCreateImage", ctypes.POINTER(_XImage), [vp, vp, ui, i, vp, info, ui, ui]),
+                (xext, "XShmAttach", i, [vp, info]), (xext, "XShmDetach", i, [vp, info]),
+                (xext, "XShmGetImage", i, [vp, ul, ctypes.POINTER(_XImage), i, i, ul]),
+                (libc, "shmget", i, [i, ctypes.c_size_t, i]), (libc, "shmat", vp, [i, vp, i]),
+                (libc, "shmdt", i, [vp]), (libc, "shmctl", i, [i, i, vp])):
+            getattr(lib, name).restype = res
+            getattr(lib, name).argtypes = args
+        if not xext.XShmQueryExtension(self.dpy):
+            return
+        self._shm = (xext, libc, self.x.XDefaultVisual(self.dpy, screen), self.x.XDefaultDepth(self.dpy, screen))
+        # The extension may be there while the segment cannot be shared (an X server on
+        # another machine): then the first capture fails and XGetImage is used instead.
+        if self._shm_view(0, 0, 1, 1) is None:
+            raise QrxferError("MIT-SHM unusable")
+        self.name = "Xlib (MIT-SHM)"
+
+    def _shm_close(self):
+        for size in list(self._segments):
+            self._shm_free(self._segments.pop(size))
+        self._shm, self.name = None, XlibGrabber.name
+
+    def _shm_free(self, segment):
+        img, info, _ = segment
+        xext, libc = self._shm[:2]
+        xext.XShmDetach(self.dpy, ctypes.byref(info))
+        self.x.XSync(self.dpy, 0)
+        img.contents.data = None  # the segment is not XDestroyImage's to free
+        self.x.XDestroyImage(img)
+        libc.shmdt(info.shmaddr)
+
+    def _shm_view(self, left, top, width, height):
+        """The region's pixels as a view of the shared segment, or None."""
+        xext, libc, visual, depth = self._shm
+        segment = self._segments.pop((width, height), None)
+        if segment is None:
+            info = _XShmSegmentInfo()
+            img = xext.XShmCreateImage(self.dpy, visual, depth, 2, None, ctypes.byref(info), width, height)
+            if not img:
+                return None
+            size = img.contents.bytes_per_line * height
+            info.shmid = libc.shmget(0, size, 0o1600)  # IPC_PRIVATE; IPC_CREAT | 0600
+            addr = libc.shmat(info.shmid, None, 0) if info.shmid >= 0 else None
+            if addr in (None, ctypes.c_void_p(-1).value):
+                if info.shmid >= 0:
+                    libc.shmctl(info.shmid, 0, None)
+                img.contents.data = None
+                self.x.XDestroyImage(img)
+                return None
+            info.shmaddr = img.contents.data = addr
+            xext.XShmAttach(self.dpy, ctypes.byref(info))
+            self.x.XSync(self.dpy, 0)
+            libc.shmctl(info.shmid, 0, None)  # IPC_RMID: gone once both sides let go, even after a crash
+            view = self.np.frombuffer((ctypes.c_uint8 * size).from_address(addr), self.np.uint8)
+            segment = (img, info, view.reshape(height, img.contents.bytes_per_line // 4, 4))
+            while len(self._segments) >= self.SHM_SIZES:
+                self._shm_free(self._segments.popitem(last=False)[1])
+        self._segments[(width, height)] = segment
+        if not xext.XShmGetImage(self.dpy, self.root, segment[0], left, top, 0xFFFFFFFF):
+            return None
+        return segment[2][:, :width]
 
     def _get(self, left, top, width, height):
         img = self.x.XGetImage(self.dpy, self.root, left, top, width, height, 0xFFFFFFFF, 2)
@@ -1717,6 +1871,11 @@ class XlibGrabber:
         """The region as a numpy array: 2-D (the green channel; codes are black on white,
         so one channel is as good as luminance), or with colour the raw 32-bit pixels as
         (height, width, 4) bytes, red, green and blue at the indices in .channels."""
+        if self._shm:
+            # A copy: decoder threads still read it while the next capture is made.
+            pixels = self._shm_view(left, top, width, height)
+            if pixels is not None:
+                return pixels.copy() if colour else self.np.ascontiguousarray(pixels[..., self.channels[1]])
         img = self._get(left, top, width, height)
         try:
             im = img.contents
@@ -2045,13 +2204,22 @@ class GridReader:
     name = "a colour grid"
 
     RECHECK_EVERY = 0.5  # seconds between searches while the bottom ring is unseen
+    COVER_READS = 40     # captures per clone between checks for rows that never read
+    NOTICE_EVERY = 60.0  # seconds between notices about such rows
 
     def __init__(self, np, channels, shared=None):
         self.np, self.channels = np, channels
-        self.shared = {"geometry": None, "searched": 0.0} if shared is None else shared
+        self.shared = ({"geometry": None, "searched": 0.0, "notice": None, "noticed": None}
+                       if shared is None else shared)
+        self._fails, self._reads = None, 0  # per clone: failures by row since the last check
 
     def clone(self):
         return GridReader(self.np, self.channels, self.shared)
+
+    def take_notice(self):
+        """A message about rows that something on the screen keeps covering, once."""
+        notice, self.shared["notice"] = self.shared["notice"], None
+        return notice
 
     def read(self, img, box, full):
         geo = self.shared["geometry"]
@@ -2075,15 +2243,45 @@ class GridReader:
         return found
 
     def _rows(self, img, box, geo):
-        out = []
+        out, failed = [], []
         if geo is None or not geo.within(box):
             return out
-        for raw in read_grid_rows(self.np, img, geo.xs - box[0], geo.ys - box[1], self.channels):
+        for y, raw in enumerate(read_grid_rows(self.np, img, geo.xs - box[0], geo.ys - box[1], self.channels)):
             try:
                 out.append((parse_frame_bytes(raw), geo.box))
             except ValueError:
-                pass
+                failed.append(y)
+        if len(out) > len(failed):
+            self._watch(geo, failed)
         return out
+
+    def _watch(self, geo, failed):
+        # Torn captures fail a row here and there; rows failing in (nearly) every capture
+        # are covered, e.g. by a dock over the bottom of the VNC viewer. Their blocks
+        # then only arrive in later rounds of repeats, so say so.
+        rows = len(geo.ys)
+        if self._fails is None or len(self._fails) != rows:
+            self._fails, self._reads = [0] * rows, 0
+        for y in failed:
+            self._fails[y] += 1
+        self._reads += 1
+        if self._reads < self.COVER_READS:
+            return
+        dead = [y for y, n in enumerate(self._fails) if n * 10 >= self._reads * 9]
+        self._fails, self._reads = [0] * rows, 0
+        now, noticed = time.monotonic(), self.shared["noticed"]
+        if dead and len(dead) < rows // 2 and (noticed is None or now - noticed >= self.NOTICE_EVERY):
+            self.shared["noticed"] = now
+            spans, start = [], dead[0]
+            for a, b in zip(dead, dead[1:] + [None]):
+                if b != a + 1:
+                    spans.append("%d" % (start + 1) if a == start else "%d-%d" % (start + 1, a + 1))
+                    start = b
+            self.shared["notice"] = (
+                "Grid row%s %s of %d (screen y %d-%d) failed in nearly all of the last %d captures: "
+                "is something covering that part of the window, such as a panel or dock?"
+                % ("" if len(dead) == 1 else "s", ", ".join(spans), rows, geo.ys[dead[0]],
+                   geo.ys[dead[-1]], self.COVER_READS))
 
 
 class AutoReader:
@@ -2103,6 +2301,9 @@ class AutoReader:
 
     def clone(self):
         return AutoReader(self.grid.clone(), self.qr and self.qr.clone(), self.shared)
+
+    def take_notice(self):
+        return self.grid.take_notice()
 
     def read(self, img, box, full):
         mode = self.shared["mode"]
@@ -2164,12 +2365,23 @@ class RegionTracker:
 
 
 class Progress:
+    """The progress line. Its rate is the recent one (RECENT seconds), with the average
+    since the first frame beside it: once the first pass is over, blocks arrive far more
+    slowly, and the average alone kept looking like a slow link."""
+
+    RECENT = 30.0
+
     def __init__(self, stream=sys.stderr):
         self.out = stream
         self.tty = stream.isatty()
         self.t0 = None
         self.last = 0.0
         self.waiting_shown = False
+        self.samples = collections.deque()  # (time, rank) over the last RECENT seconds
+
+    def note(self, text):
+        self.out.write(("\r%s\x1b[K\n" if self.tty else "%s\n") % text)
+        self.out.flush()
 
     def update(self, sess, force=False):
         now = time.monotonic()
@@ -2186,12 +2398,19 @@ class Progress:
         self.last = now
         frac = sess.rank / float(sess.k)
         elapsed = now - self.t0
-        rate = sess.rank / elapsed if elapsed >= 1.0 else 0.0  # too early to tell before 1 s
+        average = sess.rank / elapsed if elapsed >= 1.0 else 0.0  # too early to tell before 1 s
+        samples = self.samples
+        samples.append((now, sess.rank))
+        while len(samples) > 2 and now - samples[1][0] >= self.RECENT:
+            samples.popleft()
+        span = now - samples[0][0]
+        rate = (sess.rank - samples[0][1]) / span if span >= 1.0 else average
         eta = human_time((sess.k - sess.rank) / rate) if rate > 0 else "--:--"
         filled = int(frac * 28)
-        line = ("[%s%s] %5.1f%%  %d/%d blocks  %s/s  ETA %s  frames %d"
+        speed = (lambda r: human_size(r * sess.block_size) if r > 0 else "--")
+        line = ("[%s%s] %5.1f%%  %d/%d blocks  %s/s (average %s/s)  ETA %s  frames %d"
                 % ("#" * filled, "-" * (28 - filled), frac * 100, sess.rank, sess.k,
-                   human_size(rate * sess.block_size) if rate > 0 else "--", eta, sess.received))
+                   speed(rate), speed(average), eta, sess.received))
         self.out.write(("\r" + line + "\x1b[K") if self.tty else line + "\n")
         self.out.flush()
 
@@ -2256,6 +2475,9 @@ def collect_from_screen(grabber, reader, region=None, progress=None, timeout=Non
                         progress.done()
                         return sess
                 tracker.update(found, reader.track_margin)
+            notice = reader.take_notice() if hasattr(reader, "take_notice") else None
+            if notice:
+                progress.note(notice)
             progress.update(current)
             if timeout is not None and time.monotonic() - started > timeout:
                 progress.done()
@@ -2310,7 +2532,11 @@ def cmd_send(args):
 
 
 def _send(args, window):
-    archive, nfiles, nbytes = pack_paths(args.paths)
+    threads = args.threads or xz_threads()
+    # Big inputs take minutes before the passphrase prompt: say what is going on.
+    print("Packing and compressing on up to %d thread%s..." % (threads, "" if threads == 1 else "s"),
+          flush=True)
+    archive, nfiles, nbytes = pack_paths(args.paths, threads)
     secret, _ = obtain_passphrase(args, "send")
     blob = encrypt(archive, secret)
     del archive  # a big transfer keeps enough copies in memory as it is
@@ -2558,8 +2784,8 @@ def cmd_selftest(args):
             g = XlibGrabber()
             t = time.perf_counter()
             g.grab(0, 0, min(800, g.width), min(800, g.height))
-            report("screen capture", True, "%dx%d, 800x800 region in %.0f ms"
-                   % (g.width, g.height, (time.perf_counter() - t) * 1000))
+            report("screen capture", True, "%dx%d, 800x800 region in %.0f ms (%s)"
+                   % (g.width, g.height, (time.perf_counter() - t) * 1000, g.name))
         except QrxferError as exc:
             report("screen capture", False, str(exc))
     else:
@@ -2665,6 +2891,8 @@ def build_parser():
     s.add_argument("--ecc", choices=list(QR_LEVELS), default="L", help="QR error correction level (default L)")
     s.add_argument("--terminal", action="store_true", help="QR: draw codes in this terminal instead of a window")
     s.add_argument("--windowed", action="store_true", help="QR: use a normal window instead of full screen")
+    s.add_argument("--threads", type=int, choices=range(1, 1025), metavar="N",
+                   help="compress on N threads (default: one per CPU, within a quarter of the RAM)")
     s.set_defaults(func=cmd_send)
 
     r = sub.add_parser("recv", help="capture the screen and receive files")

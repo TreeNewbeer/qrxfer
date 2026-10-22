@@ -79,6 +79,16 @@ class SkillTransferTest(unittest.TestCase):
         self.assertEqual(os.readlink(target / 'relative'), '../external-target')
         self.assertEqual(set(result['external_or_broken_links']), {'outside', 'relative'})
 
+    def test_bundle_compresses_in_independent_xz_streams(self):
+        with mock.patch.object(transfer, 'XZ_CHUNK', 1024):
+            self.receive()
+        payload = (self.work / 'received/payload.tar.xz').read_bytes()
+        self.assertGreater(payload.count(b'\xfd7zXZ\x00'), 1)
+        result = self.install()
+        self.assertEqual(result['status'], 'PASS')
+        self.assertEqual((pathlib.Path(result['target']) / '.hidden').read_bytes(),
+                         (self.source / '.hidden').read_bytes())
+
     def test_payload_corruption_does_not_publish(self):
         self.receive()
         path = self.work / 'received/payload.tar.xz'
@@ -239,6 +249,49 @@ class SkillTransferTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'not a VNC viewer'), \
                 mock.patch.object(transfer.subprocess, 'check_output', lambda command: b'"xterm"'):
             transfer.keep_awake(argparse.Namespace(window=42, pid=os.getpid(), every=0.4))
+
+    def test_place_moves_the_viewer_clear_of_docks_and_restores_it(self):
+        atoms, calls = {}, []
+
+        class FakeX11:
+            def __getattr__(self, name):
+                def call(*args):
+                    if name == 'XInternAtom':
+                        return atoms.setdefault(args[1].decode(), 100 + len(atoms))
+                    if name == 'XSendEvent':
+                        event = args[4]._obj
+                        calls.append(('message', event.message_type, event.window, list(event.data)))
+                    elif name == 'XChangeProperty':
+                        calls.append(('hints', args[1], list(args[6])))
+                    return 1
+                setattr(self, name, call)  # prototypes get assigned to it
+                return call
+
+        def output(command, **kwargs):
+            if command[:2] == ['xprop', '-id']:
+                return b'WM_CLASS(STRING) = "vncviewer", "Vncviewer"\n'
+            if command[:2] == ['xprop', '-root']:
+                return '_NET_WORKAREA(CARDINAL) = 0, 643, 4000, 1917, 0, 643, 4000, 1917\n'
+            return ('  Absolute upper-left X:  1440\n  Absolute upper-left Y:  643\n'
+                    '  Width: 2560\n  Height: 1351\n')
+
+        with mock.patch.object(transfer.ctypes, 'CDLL', lambda name: FakeX11()), \
+                mock.patch.object(transfer.subprocess, 'check_output', output), \
+                mock.patch.object(transfer.time, 'sleep', lambda s: None), \
+                contextlib.redirect_stdout(io.StringIO()) as log:
+            transfer.place(argparse.Namespace(window=42, x=None, y=None, restore=False))
+            transfer.place(argparse.Namespace(window=42, x=None, y=None, restore=True))
+        state, vert, horz = (atoms['_NET_WM_STATE'], atoms['_NET_WM_STATE_MAXIMIZED_VERT'],
+                             atoms['_NET_WM_STATE_MAXIMIZED_HORZ'])
+        self.assertIn('_MOTIF_WM_HINTS', atoms)
+        self.assertEqual(calls, [
+            ('hints', 42, [2, 0, 0, 0, 0]),  # no decorations, so the title bar needs no room
+            ('message', state, 42, [0, vert, horz, 2, 0]),  # unmaximize
+            ('message', atoms['_NET_MOVERESIZE_WINDOW'], 42, [10 | 3 << 8 | 2 << 12, 1440, 643, 0, 0]),
+            ('hints', 42, [2, 0, 1, 0, 0]),
+            ('message', state, 42, [1, vert, horz, 2, 0])])
+        self.assertEqual(json.loads(log.getvalue().splitlines()[0]),
+                         {'window': 42, 'x': 1440, 'y': 643, 'width': 2560, 'height': 1351})
 
     def test_type_releases_return_when_the_window_closes_on_it(self):
         line = self.root / 'line.txt'

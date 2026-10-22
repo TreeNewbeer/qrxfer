@@ -102,7 +102,7 @@ class GridFormatTest(unittest.TestCase):
             after, repair, repeat = screens[34:], 1020, 0
             for i, seqs in enumerate(after):
                 if i % (stream.repeats + 1):
-                    self.assertEqual(seqs, [(repeat + j) % 1000 for j in range(30)])
+                    self.assertEqual(seqs, [stream.repeat_block(repeat + j) for j in range(30)])
                     repeat += 30
                 else:
                     self.assertEqual(seqs, list(range(repair, repair + 30)))
@@ -115,6 +115,26 @@ class GridFormatTest(unittest.TestCase):
             self.assertEqual({sum(made[i:i + cycle]) for i in range(34, len(made) - cycle + 1, cycle)}, {30})
         for k, repeats in ((q.GridStream.MANY_REPEATS_K - 1, 1), (q.GridStream.MANY_REPEATS_K, 3)):
             self.assertEqual(q.GridStream(q.FountainEncoder(bytes(k), 1, 5), 99, 30).repeats, repeats)
+
+    def test_repeat_rounds_move_blocks_to_other_rows(self):
+        # A band of rows covered on the receiver (a dock over the viewer) must hide other
+        # blocks on each round of repeats than in the first pass, where block b sat in row
+        # b % rows: every round shows each block once, shifted by its own number of rows.
+        for k, rows in ((1000, 30), (2887084 // 50, 439)):
+            stream = q.GridStream(q.FountainEncoder(bytes(k), 1, 5), 99, rows)
+            shifts = []
+            for c in range(3):
+                blocks = [stream.repeat_block(n) for n in range(c * k, (c + 1) * k)]
+                self.assertEqual(sorted(blocks), list(range(k)))
+                moved = {(b - n) % rows for n, b in enumerate(blocks, c * k) if b >= rows}
+                self.assertEqual(len(moved), 1, (k, rows, c))
+                shifts.append(moved.pop())
+            self.assertNotIn(0, shifts)
+            self.assertEqual(len(set(shifts)), 3)
+            if rows == 439:  # a full 2560x1351 screen: the 8 rows a dock hid came back elsewhere
+                hidden = {b for b in range(rows, k) if b % rows >= rows - 8}
+                for c, shift in enumerate(shifts):
+                    self.assertFalse({b for b in hidden if (b - shift) % rows >= rows - 8}, c)
 
     def test_painter_colours_and_ring(self):
         painter = q.GridPainter(3, 1, 2, lambda r, g, b: bytes((r, g, b, 0)))
@@ -480,6 +500,36 @@ class ArchiveTest(unittest.TestCase):
         with self.assertRaises(q.QrxferError):
             q.pack_paths([os.path.join(self.tmp, "nope")])
 
+    def test_parallel_xz_reads_as_one_file(self):
+        import lzma
+        from unittest import mock
+        data = os.urandom(20000) + b"compressible text " * 3000
+        with mock.patch.object(q, "XZ_CHUNK", 4096):
+            buf = io.BytesIO()
+            with q.XzWriter(buf, 6, 3) as xz:
+                for i in range(0, len(data), 1000):
+                    xz.write(data[i:i + 1000])
+            # one independent stream per chunk (five writes reach 4096), put back together in order
+            self.assertGreaterEqual(buf.getvalue().count(b"\xfd7zXZ\x00"), len(data) // 5000)
+            self.assertEqual(lzma.decompress(buf.getvalue()), data)
+            empty = io.BytesIO()
+            with q.XzWriter(empty, 6, 2):
+                pass
+            self.assertEqual(lzma.decompress(empty.getvalue()), b"")
+            with self.assertRaises(ZeroDivisionError):
+                with q.XzWriter(io.BytesIO(), 6, 2) as xz:
+                    xz.write(os.urandom(50000))
+                    1 / 0
+            src = os.path.dirname(self.write("tree/a.bin", os.urandom(30000)))
+            self.write("tree/sub/b.txt", data)
+            for threads in (1, 4):
+                archive, nfiles, nbytes = q.pack_paths([src], threads)
+                self.assertEqual((nfiles, nbytes), (2, 30000 + len(data)))
+                out = os.path.join(self.tmp, "out%d" % threads)
+                q.unpack_archive(archive, out)
+                with open(os.path.join(out, "tree/sub/b.txt"), "rb") as fh:
+                    self.assertEqual(fh.read(), data)
+
     def test_unsafe_archive_rejected(self):
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
@@ -681,6 +731,7 @@ class FakeGridGrabber:
     """Pretends to be the screen with the sender's grid on it, in BGRX like XGetImage."""
 
     channels = (2, 1, 0)
+    band = None  # (rows, columns) of pixels that something covers on the screen
 
     def __init__(self, np, stream, every=3):
         self.np, self.stream, self.every = np, stream, every
@@ -696,6 +747,8 @@ class FakeGridGrabber:
             self.screen = place_on_desktop(self.np, render_grid_screen(self.np, frames, self.stream.cols,
                                                                        self.stream.rows))
             self.height, self.width = self.screen.shape[:2]
+            if self.band is not None:
+                self.screen[self.band] = 128
         self.calls += 1
         region = self.screen[top:top + height, left:left + width]
         return region if colour else self.np.ascontiguousarray(region[..., 1])
@@ -736,6 +789,45 @@ class GridReceivePipelineTest(unittest.TestCase):
             sess = q.collect_from_screen(grabber, reader, progress=q.Progress(io.StringIO()), timeout=60)
             self.assertEqual(sess.result(), blob[:20000])
             self.assertEqual(reader.shared["mode"], "qr")
+
+
+    def test_covered_rows_are_reported_and_still_arrive(self):
+        # A dock over the bottom of the viewer hides the same rows on every capture: the
+        # receiver says so, and the repeats bring those blocks in other rows.
+        import numpy as np
+        from unittest import mock
+        blob = q.encrypt(os.urandom(150000), "pw")
+        cols, rows = q.plan_cells(900, 500, 3)
+
+        stream = q.GridStream(q.FountainEncoder(blob, q.grid_block_size(cols), 31), cols, rows)
+        grabber = FakeGridGrabber(np, stream)
+        geo = q.locate_grid(np, grabber.screen, grabber.channels)
+        grabber.band = (slice(geo.ys[-3] - 1, geo.ys[-1] + 2), slice(geo.xs[cols // 3], geo.xs[cols // 2]))
+        out = io.StringIO()
+        with mock.patch.object(q.GridReader, "COVER_READS", 10):
+            sess = q.collect_from_screen(grabber, q.GridReader(np, grabber.channels),
+                                         progress=q.Progress(out), timeout=60)
+        self.assertEqual(sess.result(), blob)
+        self.assertIn("Grid rows %d-%d of %d" % (rows - 2, rows, rows), out.getvalue())
+        self.assertIn("is something covering", out.getvalue())
+
+    def test_progress_shows_the_recent_rate_beside_the_average(self):
+        from unittest import mock
+
+        class Sess:
+            k, block_size, received = 10000, 100, 0
+            rank = 0
+
+        out, sess, clock = io.StringIO(), Sess(), [0.0]
+        progress = q.Progress(out)
+        with mock.patch.object(q.time, "monotonic", lambda: clock[0]):
+            for t, rank in ((0, 0), (60, 9000), (90, 9010), (120, 9020)):
+                clock[0], sess.rank = float(t), rank
+                progress.update(sess, force=True)
+        last = out.getvalue().strip().splitlines()[-1]
+        # 10 blocks in the last 30 s, 9020 in 120 s on average
+        self.assertIn("33 B/s (average 7.3 KB/s)", last)
+        self.assertIn("ETA 49:00", last)
 
 
 class CliTest(unittest.TestCase):
