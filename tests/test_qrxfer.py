@@ -136,6 +136,32 @@ class GridFormatTest(unittest.TestCase):
                 for c, shift in enumerate(shifts):
                     self.assertFalse({b for b in hidden if (b - shift) % rows >= rows - 8}, c)
 
+    def test_requested_blocks_come_next_last_first(self):
+        # A request is shown after the first pass, on screens of its own and last block
+        # first, filling up its last screen with the same blocks again; then the stream
+        # goes on exactly as it would have.
+        def screens(stream, n):
+            return [[q.parse_frame_bytes(raw).seq for raw in stream.take(30)] for _ in range(n)]
+
+        enc = q.FountainEncoder(os.urandom(1000 * 8), 8, 5)
+        plain, asked = q.GridStream(enc, 99, 30), q.GridStream(enc, 99, 30)
+        expected = screens(plain, 40)
+        asked.request([(10, 20), (500, 545)])  # during the first pass: served after it
+        self.assertEqual(asked.phase(), "first pass 0%")
+        got = screens(asked, 34)
+        self.assertEqual(asked.phase(), "requested blocks, 55 left")
+        got += screens(asked, 2)
+        self.assertEqual(got[34], list(range(544, 514, -1)))
+        self.assertEqual(got[35], list(range(514, 499, -1)) + list(range(19, 9, -1)) + list(range(544, 539, -1)))
+        self.assertEqual(asked.phase(), "repair + repeats")
+        got += screens(asked, 6)
+        self.assertEqual(got[:34] + got[36:], expected)
+        asked.request([(7, 8)])
+        asked.request([(3, 4)])  # replaces the one before
+        self.assertEqual(screens(asked, 1), [[3] * 30])
+        asked.request([])
+        self.assertEqual(asked.phase(), "repair + repeats")
+
     def test_painter_colours_and_ring(self):
         painter = q.GridPainter(3, 1, 2, lambda r, g, b: bytes((r, g, b, 0)))
         rows = [bytes(1)]
@@ -175,6 +201,90 @@ def place_on_desktop(np, grid, top=40, left=70):
 
 
 @unittest.skipUnless(HAVE_NUMPY, "numpy missing")
+class RequestTest(unittest.TestCase):
+    def test_wire_format_is_stable(self):
+        # Changing these breaks requests between qrxfer copies on two machines.
+        keys = q.encode_request(0xC0FFEE, [(0, 1), (5, 9), (300, 301)])
+        self.assertEqual(keys, "xtgwwve0043hi30kniotsd")
+        self.assertEqual(q.parse_request(keys[1:], 0xC0FFEE, 301), [(0, 1), (5, 9), (300, 301)])
+
+    def test_keys_roundtrip_and_damage(self):
+        rnd = random.Random(4)
+        # No key may also be one of the sender's commands: q quits, space pauses, +/- speed.
+        typed = set(q._REQUEST_LAST + q._REQUEST_MORE + q.REQUEST_KEY)
+        self.assertEqual(len(typed), 33)
+        self.assertFalse(typed & set("qQ +=-_\r\n\x1b"))
+        for _ in range(50):
+            cuts = sorted(rnd.sample(range(1, 3000000), 2 * rnd.randrange(0, 40)))
+            ranges = list(zip(cuts[::2], cuts[1::2]))
+            tid = rnd.getrandbits(32)
+            keys = q.encode_request(tid, ranges)
+            self.assertEqual(keys[0], q.REQUEST_KEY)
+            self.assertEqual(q.parse_request(keys[1:], tid, 3000000), ranges)
+            for bad in (keys[1:-1], keys[2:], keys[1:] + "0"):
+                with self.assertRaises(ValueError):
+                    q.parse_request(bad, tid, 3000000)
+            pos = rnd.randrange(1, len(keys))
+            damaged = keys[1:pos] + q._REQUEST_LAST[(q._REQUEST_LAST.find(keys[pos]) + 1) % 16] + keys[pos + 1:]
+            with self.assertRaises(ValueError):  # a different key, or a digit of the wrong kind
+                q.parse_request(damaged, tid, 3000000)
+            with self.assertRaises(ValueError):
+                q.parse_request(keys[1:], tid ^ 1, 3000000)
+            if ranges:
+                with self.assertRaises(ValueError):
+                    q.parse_request(keys[1:], tid, ranges[-1][1] - 1)
+        for bad in ("", "0", "x0", "g"):
+            with self.assertRaises(ValueError):
+                q.parse_request(bad, 0, 10)
+
+    def test_fit_request_merges_the_smallest_gaps(self):
+        rnd = random.Random(5)
+        start, ranges = 0, []
+        for _ in range(3000):
+            start += rnd.randrange(1, 2000)
+            ranges.append((start, start + rnd.randrange(1, 440)))
+            start = ranges[-1][1]
+        keys, merged = q.fit_request(7, ranges, 4000)
+        self.assertLessEqual(len(keys), 4000)
+        self.assertGreater(len(keys), 3000)
+        self.assertEqual(q.parse_request(keys[1:], 7, start), merged)
+        covered = set()
+        for a, b in merged:
+            covered.update(range(a, b))
+        self.assertTrue(all(set(range(a, b)) <= covered for a, b in ranges))
+        kept = [b[0] - a[1] for a, b in zip(merged, merged[1:])]
+        lost = sorted(b[0] - a[1] for a, b in zip(ranges, ranges[1:]) if b[0] - a[1] not in kept)
+        self.assertLessEqual(lost[-1], min(kept))  # only the smallest gaps were merged away
+        self.assertEqual(q.fit_request(7, ranges[:5], 4000)[1], ranges[:5])
+        self.assertEqual(q.fit_request(7, ranges, 20)[1], [(ranges[0][0], start)])
+
+    def test_sender_takes_requests_from_keys(self):
+        class Opts:
+            fps = 10.0
+
+        enc = q.FountainEncoder(os.urandom(1000 * 8), 8, 0x1234)
+        stream = q.GridStream(enc, 99, 30)
+        state = q._SendState(stream, Opts())
+        for key in q.encode_request(0x1234, [(10, 20)]) + "\r":
+            self.assertTrue(state.handle_key(key))
+        self.assertEqual(stream._wanted, ([(10, 20)], 10))
+        for key in q.encode_request(0x1234, [(30, 40)])[:-1] + "\r":  # a key lost on the way
+            state.handle_key(key)
+        for key in list(q.encode_request(0x4321, [(30, 40)])) + ["Return"]:  # another transfer; a Tk keysym
+            state.handle_key(key)
+        self.assertEqual((state.requests, state.bad_requests), (1, 2))
+        self.assertIn("requests 1 (2 bad)", state.status(30))
+        for key in "x12 ":  # any other key ends a request and does its own thing
+            state.handle_key(key)
+        self.assertTrue(state.paused)
+        self.assertEqual(state.bad_requests, 3)
+        self.assertFalse(state.handle_key("q"))
+        self.assertEqual(stream._wanted, ([(10, 20)], 10))
+        qr = q._SendState(q.FrameStream(enc, "L"), Opts())  # QR codes take no requests
+        self.assertTrue(qr.handle_key("x"))
+        self.assertIsNone(qr.typed)
+
+
 class GridReadTest(unittest.TestCase):
     CH = (2, 1, 0)
 
@@ -399,6 +509,16 @@ class FountainTest(unittest.TestCase):
             dec.add(enc.frame(repair))
         self.assertEqual(dec.result(), blob)
         self.assertLess(repair - enc.k - 14 * 500, 800)  # 668
+
+    def test_missing_ranges(self):
+        enc = q.FountainEncoder(os.urandom(100 * 4), 4, 1)
+        dec = q.FountainDecoder.for_frame(enc.frame(0))
+        self.assertEqual(dec.missing_ranges(), [(0, 100)])
+        for seq in list(range(10)) + list(range(20, 99)):
+            dec.add(enc.frame(seq))
+        self.assertEqual(dec.missing_ranges(), [(10, 20), (99, 100)])
+        dec.add(enc.frame(99))
+        self.assertEqual(dec.missing_ranges(), [(10, 20)])
 
     def test_other_transfer_rejected(self):
         a = q.FountainEncoder(b"a" * 100, 10, 1)
@@ -754,6 +874,43 @@ class FakeGridGrabber:
         return region if colour else self.np.ascontiguousarray(region[..., 1])
 
 
+class LossyGridGrabber(FakeGridGrabber):
+    """A FakeGridGrabber on a fake clock (30 captures/s) whose screens are lost on the way
+    a fifth of the time: the sender shows them, but they are replaced before any capture."""
+
+    def __init__(self, np, stream, clock, rnd, every=3):
+        self.clock, self.rnd = clock, rnd
+        FakeGridGrabber.__init__(self, np, stream, every)
+
+    def grab(self, left, top, width, height, colour=False):
+        self.clock[0] += 1 / 30.0
+        if self.calls % self.every == 0 and self.screen is not None and self.rnd.random() < 0.2:
+            self.stream.take(self.stream.rows)
+        return FakeGridGrabber.grab(self, left, top, width, height, colour)
+
+
+class SenderOpts:
+    fps = 10.0
+
+
+class SenderKeyboard:
+    """Types requests straight into a grid sender's key handling, instead of a VNC viewer."""
+
+    error = None
+
+    def __init__(self, state):
+        self.state, self.typed = state, []
+
+    def busy(self):
+        return False
+
+    def type(self, keys):
+        self.typed.append(keys)
+        if self.state is not None:
+            for key in keys + "\r":
+                self.state.handle_key(key)
+
+
 class ColourGrabber:
     """Shows a grayscale FakeGrabber's screen in colour, as AutoReader captures it."""
 
@@ -790,6 +947,56 @@ class GridReceivePipelineTest(unittest.TestCase):
             self.assertEqual(sess.result(), blob[:20000])
             self.assertEqual(reader.shared["mode"], "qr")
 
+
+    def test_requests_bring_the_blocks_lost_in_the_first_pass(self):
+        # A fifth of the screens never reach the viewer. Asked for, the sender shows the
+        # missing blocks right after its first pass, instead of with rounds of repeats.
+        import numpy as np
+        from unittest import mock
+        blob = q.encrypt(os.urandom(150000), "pw")
+        cols, rows = q.plan_cells(900, 500, 3)
+        shown = {}
+        for ask in (False, True):
+            stream = q.GridStream(q.FountainEncoder(blob, q.grid_block_size(cols), 41), cols, rows)
+            clock = [0.0]
+            grabber = LossyGridGrabber(np, stream, clock, random.Random(7))
+            keyboard = SenderKeyboard(q._SendState(stream, SenderOpts()))
+            out = io.StringIO()
+            with mock.patch.object(q.time, "monotonic", lambda: clock[0]), \
+                    mock.patch.object(q.FountainDecoder, "SKIP_MIN_K", 0), \
+                    mock.patch.object(q.BlockRequester, "SERVED_AFTER", 0.2):  # as for many screens
+                sess = q.collect_from_screen(grabber, q.GridReader(np, grabber.channels),
+                                             progress=q.Progress(out), timeout=600,
+                                             requester=q.BlockRequester(keyboard) if ask else None)
+            self.assertEqual(sess.result(), blob)
+            shown[ask] = stream.seq // rows
+            if ask:
+                self.assertGreaterEqual(len(keyboard.typed), 2)
+                self.assertEqual(keyboard.state.requests, len(keyboard.typed))
+                self.assertIn("Asking the sender for the", out.getvalue())
+        k = -(-len(blob) // q.grid_block_size(cols))
+        self.assertLess(shown[True], k / rows + 12)
+        self.assertGreater(shown[False], 1.5 * shown[True])
+
+    def test_requests_given_up_without_answers(self):
+        from unittest import mock
+        enc = q.FountainEncoder(os.urandom(200 * 4), 4, 6)
+        sess = q.FountainDecoder.for_frame(enc.frame(0))
+        for seq in range(0, 200, 3):
+            sess.add(enc.frame(seq))
+        keyboard, notes, clock = SenderKeyboard(None), [], [0.0]
+        requester = q.BlockRequester(keyboard)
+        with mock.patch.object(q.time, "monotonic", lambda: clock[0]):
+            requester.update(sess, [enc.frame(5)], notes.append)
+            self.assertEqual(keyboard.typed, [])  # the first pass is still on
+            for t in range(40):
+                clock[0] = t
+                requester.update(sess, [enc.frame(5), enc.frame(300)], notes.append)
+        self.assertEqual(len(keyboard.typed), 3)
+        self.assertEqual(q.parse_request(keyboard.typed[0][1:], 6, 200), sess.missing_ranges())
+        self.assertEqual(len(notes), 6)
+        self.assertIn("did not answer 3 times in a row; no more requests", notes[-1])
+        self.assertTrue(requester.off)
 
     def test_covered_rows_are_reported_and_still_arrive(self):
         # A dock over the bottom of the viewer hides the same rows on every capture: the

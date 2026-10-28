@@ -62,6 +62,8 @@ QRXFER_BIN_DIR=/opt/bin ./install.sh  # install to another directory
 
 Either side may start first. After the first pass over the data, each screen of repair frames is followed by a screen that repeats original frames, so a receiver started late still catches up quickly. Transfers of 65,536 frames or more (about 19 MB on a 2560-pixel-wide screen) show three repeat screens per repair screen, so the repeats go round all the data faster.
 
+Blocks lost in the first pass come back faster when the receiver may ask for them: give `recv --viewer WINDOW`, the X window id of the VNC viewer (from `xwininfo` or `xdotool search --class vnc`). Once the first pass is over, the receiver types a short request for the missing blocks into the viewer, which passes the keys on to the grid sender, and the sender shows those blocks next; then it asks again for whatever is still missing. This needs `xdotool`, and the viewer takes the keyboard focus for a few seconds each time. Without requests, the missing blocks only come with the repeat screens, which mostly hold blocks the receiver already has: an 821 MB transfer spent 18 of its 28 minutes on 9 % of the data that way.
+
 For long transfers, keep the screensavers on both sides from starting: they cover the grid, and both count idle time from the last key typed through the VNC viewer. Moving the mouse over the VNC window keeps the remote awake without sending the sender a key.
 
 ### Sender keys
@@ -72,6 +74,7 @@ For long transfers, keep the screensavers on both sides from starting: they cove
 | Space | Pause / resume |
 | `f` | Toggle full screen (QR codes in a Tk window) |
 | `q` / `Esc` / Ctrl+C | Quit |
+| `x` … Return | A request for missing blocks (grid only), as typed by `recv --viewer` |
 
 ## Agent skill: download from a VNC desktop
 
@@ -106,7 +109,7 @@ qrxfer send FILE_OR_DIR...  [-p FILE] [--codec auto|grid|qr] [--fps 12] [--cell-
                             QR codes: [--density auto|low|medium|high|BYTES] [--grid auto|COLSxROWS]
                             [--max-codes 24] [--min-px 4] [--ecc L|M|Q|H] [--terminal] [--windowed]
 qrxfer recv    [-o DIR] [-p FILE] [--codec auto|grid|qr] [--decoder auto|zxing|zbar] [--region X,Y,W,H]
-               [--timeout SECONDS] [--threads N]
+               [--timeout SECONDS] [--threads N] [--viewer WINDOW]
 qrxfer decrypt FILE.qxf [-o DIR] [-p FILE]
 qrxfer genpass
 qrxfer selftest
@@ -122,6 +125,7 @@ qrxfer selftest
 - `--region`: only watch one part of the screen (rarely needed; the codes are located automatically).
 - `--threads N` (send): compression threads; by default one per CPU, within a quarter of the RAM (like `xz -T0`). The archive is cut into 24 MiB pieces that are compressed at the same time, so this matters from about 50 MB on; on one core, xz manages only 1–2 MB/s.
 - `--threads N` (recv): number of captures decoded at the same time; by default the CPU count minus 1, at most 4.
+- `--viewer WINDOW` (recv): the VNC viewer's X window id, decimal or `0x` hex. Once the grid sender's first pass is over, the receiver asks for the blocks it misses by typing into that window with `xdotool` (it focuses the window and gives the focus back afterwards), and again after the sender has shown them. A request is `x`, digits and letters (never `q` or a space) and Return; one holds up to 4,000 keys, about 5 s of typing, and missing blocks lying close together are merged into one range to fit. The sender shows requested blocks last first, so the receiver can tell that it answered; after three requests without an answer (an older sender, keys lost) it stops asking.
 - When decryption fails (wrong passphrase) you get 3 retries; after that the encrypted data is saved as `qrxfer-YYYYMMDD-HHMMSS.qxf`, so you can retry later with `qrxfer decrypt` without sending again.
 
 ## Speed and tuning
@@ -144,7 +148,10 @@ Measured on 2026-10-13 through a real TurboVNC link on a LAN: a 2560×1351 remot
 - Keep the VNC view at 100 % scale and the whole remote screen visible. A scaled view still works (the timing rings give every cell boundary), but blends colours at cell edges.
 - `--fps` is a ceiling: when the status line shows the actual value below the target, `+` changes nothing. Through a local VNC hop the sender ran at 11.1–11.2 screens per second with `--fps 20`, `25` and `30` alike.
 - The receiver has to capture more often than the screens change. Through that hop, 1.4 or more captures per screen lost little; 0.9 needed twice as many screens and 0.55 five times as many. `recv` captures through MIT-SHM when it can, which takes half to a third of the time of `XGetImage` (56 ms for a 2560×1351 region on a busy desktop).
-- `recv`'s progress line shows the rate of the last 30 seconds and, in brackets, the average since the first frame. After the first pass the recent rate drops sharply: each later screen carries only the few blocks still missing, until the repair frames take over. That is normal as long as the block count keeps rising.
+- `recv`'s progress line shows the rate of the last 30 seconds and, in brackets, the average since the first frame. Without `--viewer`, the recent rate drops sharply after the first pass: each later screen carries only the few blocks still missing, until the repair frames take over. That is normal as long as the block count keeps rising. With `--viewer`, the log says when the receiver asks for blocks, and the rate stays up while the sender shows them.
+- On 2026-10-27, version 1.2.1 through the same link: 821 MB (2,898,277 blocks) took 28:22 from the first frame. The first pass ran at 1.7 MB/s for 8 minutes and left 9.3 % of the blocks missing; the repeat screens then brought them at 40–80 KB/s for 18 minutes, until fewer than 32,768 were missing, and the repair frames the rest in 2 minutes. A second receiver started during the repeats took 31 minutes: 20 for one round of repeats, then 11 for its last 1.6 %. Hence `recv --viewer`.
+- The blocks were lost on the receiving desktop: with glamor acceleration (an Intel iGPU) and the window manager's compositor on, every capture took 35–45 ms whatever its size, and other X clients, the VNC viewer among them, waited meanwhile. `recv` spent 85 % of its time waiting for captures: about 21 per second, only 1.4 per screen at the sender's 15 screens per second in the first pass, against 2.4 per screen at the 9 screens per second of the repeats, where it missed only 1.6 %.
+- Through a local VNC hop (Xtigervnc 1.15 → TigerVNC viewer on Xvfb, Python 3.13 sender at 20 screens per second, 10 MB = 73,542 blocks), with `recv`'s captures slowed down to about 15 per second, 22 % of the blocks were missing after the 14 s first pass: done after 37 s without `--viewer`, after 22 s with it (two requests). Started 8 s late, with nothing lost later: 18.5 s and 15 s.
 - Nothing may cover any part of the grid, not even now and then: an auto-hiding dock along the screen's edge pops up over the VNC viewer whenever another window is active, and hides the same rows of every screen. `recv` prints which rows (and screen y) keep failing; move the viewer clear of the dock.
 
 ### QR codes
@@ -181,7 +188,7 @@ Text files are compressed with xz first, so the effective file throughput is hig
 
 ## Limitations
 
-- The screen channel is one-way: files can only go from **the side that shows the screen (VNC server / remote)** to **the side that watches it (local)**. Local → remote is not possible this way.
+- The screen channel is one-way: files can only go from **the side that shows the screen (VNC server / remote)** to **the side that watches it (local)**. Local → remote is not possible this way; the keys `recv --viewer` types back carry only requests for blocks.
 - Screen capture on the receiver needs X11 (XFCE, MATE and other X11 sessions all work); in a pure Wayland session the window contents may not be capturable. The grid window on the sender likewise needs an X11 display with 24-bit colour; otherwise use QR codes (`--terminal`).
 - Suited to files from KB to hundreds of MB; time grows linearly with size (see the tables above). Hundreds of MB take minutes to tens of minutes: the sender compresses on all its cores (on one core, xz needs about 10 minutes per GB), and a 2560×1351 screen of 3-pixel cells carries about 127 KB, so 600 MB needs some 4,700 screens. Over a real VNC link, 203 MB took under 3 minutes on screen with version 1.2.1 (see above), and 857 MB 33 minutes with version 1.2.0, while a dock covered the viewer's bottom rows. A 571 MB transfer took 3.5 hours with version 1.1.0, whose receiver fell behind while solving repair frames.
 

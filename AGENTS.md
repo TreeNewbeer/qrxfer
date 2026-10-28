@@ -17,7 +17,7 @@ Guidance for coding agents working in this repository. User-facing documentation
 | Path | Purpose |
 |---|---|
 | `qrxfer.py` | The whole program, a single file meant to be copied to both machines |
-| `tests/test_qrxfer.py` | unittest suite (46 tests; `tests/test_skill_transfer.py` covers the skill helper) |
+| `tests/test_qrxfer.py` | unittest suite (54 tests; `tests/test_skill_transfer.py` covers the skill helper) |
 | `install.sh` | Copies `qrxfer.py` to `~/.local/bin/qrxfer` (or `$QRXFER_BIN_DIR`), then runs `selftest` |
 | `README.md` | User guide |
 | `skills/qrxfer/` | Shared VNC download skill and deterministic helper (prepare, place, type, bundle, install, keepawake) |
@@ -61,6 +61,9 @@ Guidance for coding agents working in this repository. User-facing documentation
    - `GridStream`: one binary frame (`frame_bytes`) per row; after the first pass, each screen of repair frames is followed by one screen repeating the systematic frames, or three from k ≥ 2^16 (`MANY_REPEATS_K`).
      Round c of repeats (`repeat_block`) shows every block (c + 1) × 0.382 × rows (mod rows) rows above its row in the first pass, so a band of rows covered on the receiver's screen hides other blocks each round; aligned repeats hid the same ones again.
      Every screen after the first pass makes an equal share of the next repair screen, so all screens take about as long to make and stay up about as long.
+   - Requests for missing blocks (`encode_request` / `parse_request`): keys typed into the VNC viewer by `recv --viewer` reach the grid's keyboard grab; `_SendState.handle_key` collects them from `x` to Return and hands the ranges to `GridStream.request`.
+     After the first pass, requested blocks come next on screens of their own, last block first, a short last screen filled up with them again; then the stream goes on where it was. No repair shares are made meanwhile, so these screens come at first-pass speed.
+     A newer request replaces the one being shown; damaged ones (a lost key, another transfer) are counted as bad on the status line.
    - `GridPainter`: pure-Python BGRX painting (one `join` over pre-rendered cells per line; frames become octal digits through a big-int XOR with the row's whitening).
    - `X11GridWindow` (libX11 through ctypes, prototypes in `_xlib()`): override-redirect full-screen window, `XPutImage` + `XSync`, keyboard grab (keys typed into the VNC viewer), hidden pointer, status line drawn with `XDrawImageString`.
    - `run_x11_grid_sender` installs SIGINT/SIGTERM handlers itself: a background job may start with SIGINT ignored.
@@ -68,6 +71,8 @@ Guidance for coding agents working in this repository. User-facing documentation
    - `XlibGrabber`: MIT-SHM (`XShmGetImage` into a SysV segment per region size, ctypes libXext) when the X server shares memory with this client, else `XGetImage`; `grab(..., colour=True)` returns raw pixels (a copy), `.channels` gives the red/green/blue byte indices.
      - Captures must come more often than screens change: through a VNC hop at ~11.7 fps, 1.4× and more lost little, 0.9× needed twice the screens and 0.55× five times.
      - With the viewer redrawing, `XGetImage` of 2560×1351 averaged 56 ms (up to 160 ms) on the real desktop; MIT-SHM takes half to a third.
+     - On 2026-10-27 (glamor on an Intel iGPU, xfwm4 compositing on) every MIT-SHM capture took 35–45 ms whatever its size, even 64×64 px, and other X clients waited meanwhile (a bare `XSync` 15 ms median); a running `recv` spent 85 % of its main thread in `XShmGetImage`, its decoder threads were idle 86 % of the time.
+       Captures from two connections at once overlap (21 → 33 full-region captures per second), but each one still holds up the viewer.
    - Decoders `ZxingDecoder` (zxing-cpp) and `ZbarDecoder` (ctypes libzbar).
      - zbar returns nothing for an image with one torn code, so it scans each band between blank pixel rows (`_code_bands`) separately.
      - Each band gets a line-skipping pass first, then a full-density pass when that finds nothing or fewer codes than last time.
@@ -78,6 +83,10 @@ Guidance for coding agents working in this repository. User-facing documentation
    - `Progress`: the rate of the last 30 s and the average since the first frame; the ETA uses the recent rate.
    - `RegionTracker` (crops to the codes, rescans the full screen every 4 s).
    - `collect_from_screen`: grabs on the main thread and decodes in `threads` worker threads, each with its own reader clone (ctypes and numpy release the GIL).
+   - `BlockRequester` (`recv --viewer`, grid only): once a repair frame shows that the first pass is over, it types a request for `FountainDecoder.missing_ranges()` through `ViewerKeyboard` (xdotool in a thread: `windowfocus --sync`, `type --delay 1`, Return, focus given back).
+     - `fit_request` merges ranges across their smallest gaps until the keys fit in 4,000 (≈ 5 s of typing at the ~870 keys/s the skill's bootstrap reached).
+     - A capture whose block numbers fall in at least a third of its row pairs is a requested screen; once none came for 1.5 s, it asks again for what is still missing.
+     - Three requests in a row without an answer within 8 s of typing, or without a new block, and it stops asking.
 9. **Commands**: `send`, `recv`, `decrypt`, `genpass`, `selftest`, wired up in `build_parser`.
 
 ## Invariants — do not break
@@ -94,11 +103,12 @@ Guidance for coding agents working in this repository. User-facing documentation
   - `_SplitMix64` / `repair_indices`;
   - the container layout and keystream (`_keystream_xor`) and the KDF ids;
   - the grid: one `frame_bytes` frame per row of cells, cell colour = 4×red + 2×green + blue from the 8 RGB cube corners, bits most significant first, zero-padded to 3×cols bits and XORed with the first 3×cols bits of bytes y×n … (y+1)×n of `grid_whitening` (SHAKE-256 of `b"qrxfer grid"`, n = ceil(3×cols/8), y = row from the top); the black/white timing ring around the cells; cells of at least 2 px.
-  - Any change needs a `FRAME_VERSION` (or container magic) bump, so that an older copy rejects it, and must update the golden values in `FrameTest.test_wire_format_is_stable`, `GridFormatTest.test_wire_format_is_stable` and `CryptoTest.test_keystream_is_stable`.
+  - the request keys: `x`, then numbers of hex digits (the last one from `0-9a-f`, the others from `g-p r-w`, so no `q` or space), Return; the numbers are the transfer id, the gap from the previous range's end and the length minus one per range, and the CRC32 of the keys before it. Requested blocks are shown last first, which the receiver takes for the answer.
+  - Any change needs a `FRAME_VERSION` (or container magic, or `REQUEST_KEY`) bump, so that an older copy rejects it, and must update the golden values in `FrameTest.test_wire_format_is_stable`, `GridFormatTest.test_wire_format_is_stable`, `RequestTest.test_wire_format_is_stable` and `CryptoTest.test_keystream_is_stable`.
 - The repair **degree distribution** (`repair_degree`, `REPAIR_DEGREE_CAP = 256`) is sender-only, because the degree travels in each frame. It may be tuned freely; re-check the overhead with the fountain tests.
 - Also sender-only, since every QR code carries its own version and mask: `FRAME_MASK`, `AUTO_VERSIONS`, the block size and the layout.
   - Before raising `AUTO_VERSIONS` above 17, measure zbar: its decode time per byte rises steeply for bigger codes.
-- Sender-only for the grid as well, since the receiver measures the geometry: `GRID_CELL_PX`, `plan_cells`, the status line and the order of frames in `GridStream`.
+- Sender-only for the grid as well, since the receiver measures the geometry: `GRID_CELL_PX`, `plan_cells`, the status line and the order of frames in `GridStream`, except that requested blocks come last first.
   - The receiver needs the ring directly beside the data cells, the black margin outside it, and whole rows: a row must hold one complete frame.
 - The QR encoder must stay bit-identical to segno. `QrEncoderTest.test_matches_segno` runs when `segno` is importable; use a throwaway venv.
 - Receiving must never overwrite existing files, and must keep using the tar `data` filter (or `_check_members_legacy` on old Pythons).
@@ -136,6 +146,8 @@ python3 qrxfer.py selftest                   # environment report + offline pipe
     - Show it on an Xvfb "local" screen: `DISPLAY=:93 vncviewer localhost::5995 -SecurityTypes=None -Shared=1 -RemoteResize=0 -AutoSelect=0 -PreferredEncoding=Tight -NoJPEG=1`.
     - Run the sender on :95 (for the terminal sender, `--font="DejaVu Sans Mono 6" --geometry=508x125+0+0` mimics the real remote run: 5×10 px cells) and `recv` on :93.
     - For the grid, the X server's encoding work is part of the sender's frame time, so measure fps through such a hop, not on a plain Xvfb.
+    - Requests: `recv --viewer $(DISPLAY=:93 xdotool search --class 'TigerVNC Viewer')`. The hop loses almost nothing (1.3 % at `--fps 30`); to lose screens like the real desktop, run `recv` through a scratch wrapper that sleeps 45–60 ms in `XlibGrabber.grab` (`--fps 20`).
+    - Run the sender with `python3 -u` when its output goes to a file: block-buffered, "Showing the grid" appears only at exit.
 - **Shell pitfalls** (the agent Bash tool runs zsh):
   - Use `${=var}` to word-split a variable.
   - Never `pkill -f`/`grep | kill` with a pattern that also appears in your own command line; it kills your own shell (exit 144). Kill recorded PIDs or process groups instead.
@@ -214,7 +226,7 @@ English is the only language of this repository.
 ## Conventions
 
 - Code style: `%`-formatting and the existing compact style; keep `qrxfer.py` a single file.
-- Project version lives in `__version__` (currently `1.2.1`).
+- Project version lives in `__version__` (currently `1.2.2`).
   - Versions skip any component containing `4` (`1.0.3` → `1.0.5`, `1.3.9` → `1.5.0`).
   - Don't bump for intermediate edits.
 - Documents have no `Revision History` table: git history is the record of revisions.
@@ -279,5 +291,11 @@ This repository is public. Never add anything that identifies a person, a specif
 - Terminal mode is bounded by the terminal's redraw rate, not by qrxfer.
 - Screensavers on either side hide the grid. Both idle timers start at the last keystroke typed through the viewer, so both fire in the middle of a long transfer (seen after 30 min on both sides, receiver stalled until woken). Keep both awake: pointer motion over the viewer wakes the remote without sending the sender a key; the skill's `keepawake` helper does that every 4 minutes.
 - The skill still compresses twice: `send` packs and xz-compresses the bundle's payload.tar.xz again, now on every core but for nothing; a store-only pack for already-compressed input would save that pass.
+- Retest on 2026-10-27 through the same real link, 1.2.1 on both sides, a skill run: 820.9 MB, k = 2,898,277, sender at ~15 fps in the first pass.
+  - Receiver started first: the first pass took 8 min at 1.7 MB/s and left 9.3 % (≈ 270,000 blocks) missing, since `recv` made only ~21 captures per second (1.4 per screen, see `XlibGrabber`).
+    The repeats then brought 40–80 KB/s for 18 min (each repeat screen held ~9 % new blocks; a round of repeats takes ~16 min at 8.9 fps, three of four screens), repair frames the last 1.1 % in 2 min: complete after 28:22. Extraction then failed with ENOSPC on a full tmpfs `/tmp`.
+  - Receiver restarted during the repeats, its output moved off the tmpfs: 20 min for one round of repeats (98.4 %, i.e. only 1.6 % lost at 2.4 captures per screen), 7 min more of repeats, then repair frames; their last ~1,600 blocks took ~4 min (coupon collector). Complete after 30:59.
+  - Hence `recv --viewer`: after the first pass, the missing blocks come at first-pass speed, ~1 min for 270,000 blocks instead of rounds of repeats. Not yet run through the real link.
+  - A probe sampling grid rows from six X connections at once made the viewer show only ~75 % of the sender's screens: captures stall the viewer, so measure with as little capturing as possible.
 - Elimination still runs on the capture loop's thread. A decoder thread with a bounded queue of repair frames would keep the capture going while it works, at the price of GIL contention.
 - The grid sender's repair phase is CPU-bound in Python (`repair_indices`); a lower repair degree for large k could help, re-check the overhead with the fountain tests.

@@ -32,14 +32,16 @@ import secrets
 import shutil
 import signal
 import struct
+import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import unicodedata
 import zlib
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 
 class QrxferError(Exception):
@@ -366,6 +368,19 @@ class FountainDecoder:
             mask ^= row[0]
             value ^= row[1]
         return False
+
+    def missing_ranges(self):
+        """(start, stop) runs of the blocks not known on their own yet."""
+        have = bytearray(self.k)
+        for i in self._known:
+            have[i] = 1
+        out, start = [], have.find(0)
+        while start >= 0:
+            stop = have.find(1, start)
+            stop = self.k if stop < 0 else stop
+            out.append((start, stop))
+            start = have.find(0, stop)
+        return out
 
     def result(self):
         if not self.complete:
@@ -1081,6 +1096,8 @@ class _SendState:
         self.quit = False
         self.started = time.monotonic()
         self.shown = collections.deque(maxlen=16)  # when recent screens appeared
+        self.typed = None  # keys of a request for blocks being typed
+        self.requests = self.bad_requests = 0
 
     def advance(self, count):
         if self.codes is None or len(self.codes) != count or not self.paused:
@@ -1096,6 +1113,19 @@ class _SendState:
 
     def handle_key(self, key):
         """Returns False when the user asked to quit."""
+        if self.typed is not None:
+            if key in ("\r", "\n", "Return", "KP_Enter"):
+                self._request("".join(self.typed))
+                self.typed = None
+                return True
+            if len(key) == 1 and key in _REQUEST_LAST + _REQUEST_MORE and len(self.typed) < REQUEST_MAX_KEYS:
+                self.typed.append(key)
+                return True
+            self.typed = None  # any other key ends the request and counts as itself
+            self.bad_requests += 1
+        if key == REQUEST_KEY and hasattr(self.stream, "request"):
+            self.typed = []
+            return True
         if key in ("q", "Q", "Escape", "\x1b"):
             return False
         if key in ("space", " "):
@@ -1109,13 +1139,25 @@ class _SendState:
             self.shown.clear()
         return True
 
+    def _request(self, keys):
+        enc = self.stream.encoder
+        try:
+            ranges = parse_request(keys, enc.tid, enc.k)
+        except ValueError:
+            self.bad_requests += 1
+            return
+        self.requests += 1
+        self.stream.request(ranges)
+
     def status(self, count):
         fps = self.actual_fps()
         rate = count * fps * self.stream.encoder.block_size
         state = "PAUSED" if self.paused else "%.1f/%.1f fps" % (fps, self.fps)
-        return ("qrxfer  frame %d  %s  %d %s%s x %s = %s/s  |  keys: space pause, +/- speed, q quit"
-                % (self.stream.seq, self.stream.phase(), count, self.stream.unit, "" if count == 1 else "s",
-                   state, human_size(rate)))
+        asked = ("  requests %d (%d bad)" % (self.requests, self.bad_requests)
+                 if self.requests or self.bad_requests else "")
+        return ("qrxfer  frame %d  %s%s  %d %s%s x %s = %s/s  |  keys: space pause, +/- speed, q quit"
+                % (self.stream.seq, self.stream.phase(), asked, count, self.stream.unit,
+                   "" if count == 1 else "s", state, human_size(rate)))
 
 
 def qr_to_pgm(rows, size):
@@ -1415,6 +1457,66 @@ def grid_row_digits(raw, cols, y):
     return format(n ^ _grid_row_pattern(cols, y + 1, y), "0%do" % cols)
 
 
+# A receiver asks for the blocks it still misses by typing keys into the VNC viewer,
+# which reach the grid sender's keyboard grab: REQUEST_KEY, numbers, Return. A number is
+# hex digits, most significant first, its last digit from _REQUEST_LAST and the others
+# from _REQUEST_MORE, so it needs no separator; neither set has q (stops the sender) or
+# space (pauses it). The numbers: the transfer id, then per range of blocks the gap from
+# the end of the range before (from 0 for the first) and the length minus one, then the
+# CRC32 of the keys between REQUEST_KEY and it.
+REQUEST_KEY = "x"
+_REQUEST_LAST, _REQUEST_MORE = "0123456789abcdef", "ghijklmnoprstuvw"
+REQUEST_MAX_KEYS = 1 << 16
+
+
+def _request_number(n):
+    digits = [_REQUEST_LAST[n & 15]]
+    n >>= 4
+    while n:
+        digits.append(_REQUEST_MORE[n & 15])
+        n >>= 4
+    return "".join(reversed(digits))
+
+
+def encode_request(tid, ranges):
+    """The keys asking the sender of transfer tid for these (start, stop) block ranges."""
+    body, end = [_request_number(tid)], 0
+    for start, stop in ranges:
+        body += [_request_number(start - end), _request_number(stop - start - 1)]
+        end = stop
+    body = "".join(body)
+    return REQUEST_KEY + body + _request_number(zlib.crc32(body.encode("ascii")))
+
+
+def parse_request(keys, tid, k):
+    """The (start, stop) ranges of a request typed after REQUEST_KEY; ValueError unless
+    the keys arrived intact and ask for blocks of this transfer."""
+    numbers, begin, n = [], 0, 0
+    for pos, key in enumerate(keys):
+        digit = _REQUEST_LAST.find(key)
+        if digit >= 0:
+            numbers.append((n << 4 | digit, begin))
+            begin, n = pos + 1, 0
+            continue
+        digit = _REQUEST_MORE.find(key)
+        if digit < 0:
+            raise ValueError("unexpected key %r in a request" % key)
+        n = n << 4 | digit
+    if begin != len(keys) or len(numbers) < 2 or len(numbers) % 2:
+        raise ValueError("incomplete request")
+    crc, at = numbers.pop()
+    if crc != zlib.crc32(keys[:at].encode("ascii")) or numbers[0][0] != tid:
+        raise ValueError("request damaged or for another transfer")
+    ranges, end = [], 0
+    for i in range(1, len(numbers), 2):
+        start = end + numbers[i][0]
+        end = start + numbers[i + 1][0] + 1
+        if end > k:
+            raise ValueError("request beyond the last block")
+        ranges.append((start, end))
+    return ranges
+
+
 class GridStream:
     """Turns fountain frames into grid rows, one frame per row of cells. After the first
     pass, each screen of new repair frames is followed by screens repeating the
@@ -1432,6 +1534,10 @@ class GridStream:
     the first pass showed it (golden-section steps): a band of rows covered on the
     receiver's screen, such as a dock popping up over the bottom of the VNC viewer, then
     hides different blocks every time instead of the same ones.
+
+    A receiver may ask for the blocks it misses (see encode_request). After the first
+    pass, those come next, on screens of their own and last block first, then the
+    stream goes on where it was.
     """
 
     unit = "row"
@@ -1444,10 +1550,33 @@ class GridStream:
         self._repair, self._repeat, self._after = encoder.k, 0, 0  # _repeat: repeat frames shown
         self._step = max(1, int(rows * 0.381966 + 0.5)) if rows > 1 else 0  # rows shifted per round
         self._ahead = []  # frames of the next repair screen, made in shares
+        self._wanted, self._serving, self._left = None, None, 0  # the latest request
 
     def phase(self):
         k = self.encoder.k
-        return "first pass %d%%" % (self.seq * 100 // k) if self.seq < k else "repair + repeats"
+        if self.seq < k:
+            return "first pass %d%%" % (self.seq * 100 // k)
+        if self._wanted is not None:
+            return "requested blocks, %d left" % (self._left if self._serving else self._wanted[1])
+        return "repair + repeats"
+
+    def request(self, ranges):
+        """Show the blocks of these (start, stop) ranges next; replaces an earlier request."""
+        total = sum(stop - start for start, stop in ranges)
+        self._wanted, self._serving = ((ranges, total) if total else None), None
+
+    def _requested(self, count):
+        # Last block first, which no other screen does: that tells the receiver its request
+        # arrived. A short last screen is filled up with the same blocks again.
+        if self._serving is None:
+            ranges, self._left = self._wanted
+            self._serving = (b for _ in itertools.count() for start, stop in reversed(ranges)
+                             for b in range(stop - 1, start - 1, -1))
+        out = [frame_bytes(self.encoder.frame(next(self._serving))) for _ in range(count)]
+        self._left -= count
+        if self._left <= 0:
+            self._wanted = self._serving = None
+        return out
 
     def _repairs(self, count):
         out = [frame_bytes(self.encoder.frame(seq)) for seq in range(self._repair, self._repair + count)]
@@ -1469,6 +1598,8 @@ class GridStream:
             n = min(count, k - self.seq)
             out = [frame_bytes(self.encoder.frame(seq)) for seq in range(self.seq, self.seq + n)]
             out += self._repairs(count - n)
+        elif self._wanted is not None:
+            out = self._requested(count)
         else:
             if self._after % (self.repeats + 1):
                 out = [frame_bytes(self.encoder.frame(self.repeat_block(n)))
@@ -1575,6 +1706,7 @@ def _xlib():
             ("XCreateBitmapFromData", ul, [vp, ul, ctypes.c_char_p, ui, ui]),
             ("XCreatePixmapCursor", ul, [vp, ul, ul, ctypes.POINTER(_XColor), ctypes.POINTER(_XColor), ui, ui]),
             ("XDefineCursor", i, [vp, ul, ul]), ("XFreeCursor", i, [vp, ul]), ("XFreePixmap", i, [vp, ul]),
+            ("XGetClassHint", i, [vp, ul, vp]), ("XFree", i, [vp]),
             ("XSync", i, [vp, i])):
         getattr(x, name).restype = res
         getattr(x, name).argtypes = args
@@ -2420,17 +2552,191 @@ class Progress:
         self.out.flush()
 
 
+def fit_request(tid, ranges, max_keys):
+    """encode_request for these ranges, merged across their smallest gaps until the keys
+    fit in max_keys (the blocks in merged gaps come again). Returns keys and ranges."""
+    keys = encode_request(tid, ranges)
+    while len(keys) > max_keys and len(ranges) > 1:
+        keep = max(1, int(len(ranges) * 0.95 * max_keys / len(keys))) - 1  # gaps that stay
+        order = sorted(range(1, len(ranges)), key=lambda i: ranges[i][0] - ranges[i - 1][1])
+        cuts = set(order[len(order) - keep:]) if keep else set()
+        merged = [ranges[0]]
+        for i in range(1, len(ranges)):
+            if i in cuts:
+                merged.append(ranges[i])
+            else:
+                merged[-1] = (merged[-1][0], ranges[i][1])
+        ranges = merged
+        keys = encode_request(tid, ranges)
+    return keys, ranges
+
+
+class _XClassHint(ctypes.Structure):
+    _fields_ = [("res_name", ctypes.c_void_p), ("res_class", ctypes.c_void_p)]
+
+
+def _window_class(window):
+    """WM_CLASS of an X window as "name class", or "" without one."""
+    x = _xlib()
+    dpy = x.XOpenDisplay(None)
+    if not dpy:
+        raise QrxferError("cannot open X display %r" % os.environ.get("DISPLAY", ""))
+    try:
+        hint, parts = _XClassHint(), []
+        if x.XGetClassHint(dpy, window, ctypes.byref(hint)):
+            for text in (hint.res_name, hint.res_class):
+                if text:
+                    parts.append(ctypes.string_at(text).decode("latin-1"))
+                    x.XFree(text)
+        return " ".join(parts)
+    finally:
+        x.XCloseDisplay(dpy)
+
+
+class ViewerKeyboard:
+    """Types into the VNC viewer window with xdotool, in a thread, while the capture goes
+    on. xdotool sends real (XTEST) key events only while that window has the focus, and
+    VNC viewers ignore any others, so it is focused first and the focus is given back
+    afterwards; if the focus moves away meanwhile, the rest of the keys go nowhere."""
+
+    def __init__(self, window):
+        if not shutil.which("xdotool"):
+            raise QrxferError("--viewer needs xdotool to type into the VNC viewer")
+        name = _window_class(window)
+        if "vnc" not in name.lower():
+            raise QrxferError("window %#x is not a VNC viewer (WM_CLASS %r)" % (window, name))
+        self.window, self.error, self._thread = str(window), None, None
+
+    def busy(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def type(self, keys):
+        self.error = None
+        self._thread = threading.Thread(target=self._type, args=(keys,))
+        self._thread.daemon = True
+        self._thread.start()
+
+    def _type(self, keys):
+        def xdotool(*args):
+            return subprocess.run(("xdotool",) + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  universal_newlines=True, check=True, timeout=30 + len(keys) / 100.0).stdout
+
+        previous = None
+        try:
+            try:
+                previous = xdotool("getwindowfocus").strip()
+            except subprocess.CalledProcessError:
+                pass
+            xdotool("windowfocus", "--sync", self.window)
+            xdotool("type", "--window", self.window, "--clearmodifiers", "--delay", "1", keys)
+            xdotool("key", "--window", self.window, "--clearmodifiers", "Return")
+        except subprocess.CalledProcessError as exc:
+            self.error = "xdotool %s: %s" % (exc.cmd[1], (exc.stderr or "").strip() or "exit %d" % exc.returncode)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.error = str(exc)
+        finally:
+            if previous and previous != self.window:
+                subprocess.call(["xdotool", "windowfocus", previous],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class BlockRequester:
+    """Asks the grid sender for the blocks still missing by typing a request into the VNC
+    viewer (encode_request): once its first pass is over (a repair frame shows up), and
+    again each time it has shown what was asked for. Otherwise the missing blocks only
+    come back with the repeat screens, which mostly hold blocks already here: with 9 %
+    of 2.9 million blocks missing after an 8-minute first pass, they took 18 more.
+
+    The sender shows requested blocks last first, as no other screen does: captures of
+    falling block numbers tell that it answered, and once they stop, that it is done.
+    Requests that stay unanswered or bring nothing new are given up after a few."""
+
+    MIN_K = 64          # smaller transfers end with a few repair frames anyway
+    MAX_KEYS = 4000     # about 5 s of typing; more ranges are merged
+    ANSWER_WAIT = 8.0   # seconds from the end of typing to the first requested screen
+    SERVED_AFTER = 1.5  # seconds without requested screens after they came
+    TRIES = 3           # unanswered or fruitless requests in a row before giving up
+
+    def __init__(self, keyboard):
+        self.keyboard = keyboard
+        self.tid, self.off = None, False
+
+    def update(self, sess, frames, note):
+        """Call after each capture with the frames read from it; note(text) reports."""
+        if self.off or sess.k < self.MIN_K:
+            return
+        if sess.tid != self.tid:  # a new transfer
+            self.tid, self.over, self.fails, self.typing = sess.tid, False, 0, False
+            self.asked = self.answered = self.last = None
+        now, falling, previous = time.monotonic(), 0, None
+        for frame in frames:
+            if frame.tid != sess.tid:
+                continue
+            if frame.seq >= sess.k:
+                self.over, previous = True, None
+            else:
+                falling += previous is not None and frame.seq <= previous
+                previous = frame.seq
+        if falling >= 2 and falling * 3 >= len(frames) and self.asked is not None:
+            self.answered = self.answered or now
+            self.last = now
+        if self.keyboard.busy():
+            return
+        if self.typing:
+            self.typing = False
+            if self.keyboard.error:
+                note("Could not type into the VNC viewer (%s); no more requests." % self.keyboard.error)
+                self.off = True
+                return
+            self.asked = now
+        if sess.complete or not self.over:
+            return
+        if self.asked is None:
+            self._ask(sess, note)
+        elif self.answered is None:
+            if now - self.asked >= self.ANSWER_WAIT:
+                self._again(sess, note, "The sender did not answer")
+        elif now - self.last >= self.SERVED_AFTER:
+            if sess.rank > self.rank:
+                self.fails = 0
+                self._ask(sess, note)
+            else:
+                self._again(sess, note, "None of the requested blocks arrived")
+
+    def _again(self, sess, note, why):
+        self.fails += 1
+        if self.fails < self.TRIES:
+            note(why + "; asking again.")
+            self._ask(sess, note)
+        else:
+            note(why + " %d times in a row; no more requests, the repeat screens bring the rest."
+                 % self.fails)
+            self.off = True
+
+    def _ask(self, sess, note):
+        missing = sess.missing_ranges()
+        keys, ranges = fit_request(sess.tid, missing, self.MAX_KEYS)
+        self.keyboard.type(keys)
+        self.typing, self.asked, self.answered, self.last, self.rank = True, None, None, None, sess.rank
+        want, asked = sum(b - a for a, b in missing), sum(b - a for a, b in ranges)
+        note("Asking the sender for the %d missing blocks%s: typing %d keys into the VNC viewer."
+             % (want, "" if asked == want else " (%d with gaps, in %d ranges)" % (asked, len(ranges)),
+                len(keys)))
+
+
 def default_decode_threads():
     return max(1, min(4, (os.cpu_count() or 1) - 1))
 
 
-def collect_from_screen(grabber, reader, region=None, progress=None, timeout=None, threads=1):
+def collect_from_screen(grabber, reader, region=None, progress=None, timeout=None, threads=1,
+                        requester=None):
     """Watch the screen until one transfer is complete; returns its FountainDecoder.
 
     reader is a QrReader, GridReader or AutoReader (a bare QR decoder is wrapped). With
     threads > 1, up to that many captures are decoded at once (each thread with its own
     reader clone) while the next one is grabbed; XGetImage, numpy and the QR decoders
-    run without the GIL, so the screen is sampled several times faster.
+    run without the GIL, so the screen is sampled several times faster. A
+    BlockRequester, if given, asks a grid sender for the blocks still missing.
     """
     from concurrent.futures import ThreadPoolExecutor
     import queue
@@ -2461,8 +2767,8 @@ def collect_from_screen(grabber, reader, region=None, progress=None, timeout=Non
             img = grabber.grab(*box, colour=True) if reader.rgb else grabber.grab(*box)
             pending.append(pool.submit(decode, img, box, full))
             while pending and (len(pending) >= threads or pending[0].done()):
-                found = []
-                for frame, where in pending.popleft().result():
+                found, frames = [], pending.popleft().result()
+                for frame, where in frames:
                     if where:
                         found.append(where)
                     sess = sessions.get(frame.tid)
@@ -2475,6 +2781,9 @@ def collect_from_screen(grabber, reader, region=None, progress=None, timeout=Non
                         progress.done()
                         return sess
                 tracker.update(found, reader.track_margin)
+                if requester is not None and current is not None and (
+                        isinstance(reader, GridReader) or getattr(reader, "shared", {}).get("mode") == "grid"):
+                    requester.update(current, [frame for frame, _ in frames], progress.note)
             notice = reader.take_notice() if hasattr(reader, "take_notice") else None
             if notice:
                 progress.note(notice)
@@ -2617,6 +2926,16 @@ def _parse_region(text):
     return tuple(int(v) for v in m.groups())
 
 
+def _parse_window(text):
+    try:
+        window = int(text, 0)
+    except ValueError:
+        window = 0
+    if window <= 0:
+        raise argparse.ArgumentTypeError("window must be an X window id, e.g. 0x3a00007 or 60817415")
+    return window
+
+
 def cmd_recv(args):
     if os.environ.get("XDG_SESSION_TYPE") == "wayland":
         print("Warning: Wayland session - X11 capture may only see X11 windows.", file=sys.stderr)
@@ -2638,13 +2957,18 @@ def cmd_recv(args):
     region = args.region
     if region and (region[0] + region[2] > grabber.width or region[1] + region[3] > grabber.height):
         raise QrxferError("region lies outside the %dx%d screen" % (grabber.width, grabber.height))
+    requester = None
+    if args.viewer is not None:
+        if args.codec == "qr":
+            raise QrxferError("--viewer asks a grid sender for blocks; drop --codec qr")
+        requester = BlockRequester(ViewerKeyboard(args.viewer))
     secret, interactive = obtain_passphrase(args, "recv")
     outdir = os.path.abspath(args.output)
     print("Watching the %dx%d screen for %s (Ctrl+C aborts). Keep the sender visible and unscaled."
           % (grabber.width, grabber.height, reader.name), flush=True)
     started = time.monotonic()
     sess = collect_from_screen(grabber, reader, region, timeout=args.timeout,
-                               threads=args.threads or default_decode_threads())
+                               threads=args.threads or default_decode_threads(), requester=requester)
     elapsed = time.monotonic() - started
     # Solving the stored equations can take minutes for a big transfer.
     print("All %d blocks arrived after %s; reassembling the data (the sender may be stopped)..."
@@ -2906,6 +3230,10 @@ def build_parser():
     r.add_argument("--timeout", type=float, help="give up after this many seconds")
     r.add_argument("--threads", type=int, choices=range(1, 17), metavar="N",
                    help="decode N captures at once (default: CPUs - 1, at most 4)")
+    r.add_argument("--viewer", type=_parse_window, metavar="WINDOW",
+                   help="grid: X window id of the VNC viewer (decimal or 0x hex); after the sender's "
+                        "first pass, ask it for the missing blocks by typing into that window "
+                        "(needs xdotool; takes the keyboard focus for a few seconds each time)")
     r.set_defaults(func=cmd_recv)
 
     d = sub.add_parser("decrypt", help="decrypt a saved .qxf transfer")
